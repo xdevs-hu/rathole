@@ -11,6 +11,7 @@ All errors are non-fatal.
 import json
 import logging
 import random
+import ssl
 import time
 import urllib.error
 import urllib.request
@@ -18,6 +19,14 @@ from dataclasses import dataclass, field
 from typing import Any
 
 log = logging.getLogger("rathole.registry")
+
+try:
+    import certifi
+    _SSL_CTX: ssl.SSLContext | None = ssl.create_default_context(cafile=certifi.where())
+except ImportError:
+    # Fall back to the system trust store. On macOS python.org installs this
+    # is empty until the user runs Install Certificates.command.
+    _SSL_CTX = ssl.create_default_context()
 
 
 @dataclass
@@ -415,7 +424,7 @@ class RegistryClient:
         for attempt in range(2):
             try:
                 req = urllib.request.Request(url, method="GET")
-                with urllib.request.urlopen(req, timeout=self._request_timeout) as resp:
+                with urllib.request.urlopen(req, timeout=self._request_timeout, context=_SSL_CTX) as resp:
                     resp_data = resp.read().decode()
                     return json.loads(resp_data) if resp_data else {}
             except urllib.error.HTTPError as e:

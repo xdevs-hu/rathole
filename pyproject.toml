@@ -22,6 +22,7 @@ dependencies = [
     "rns>=0.7.0",
     "rich>=13.0",
     "msgpack>=1.0",
+    "certifi>=2024.0",
 ]
 
 [project.urls]
