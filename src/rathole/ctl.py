@@ -2208,6 +2208,7 @@ def main():
     # ── registry ──
     reg_p = sub.add_parser("registry", help="Gateway registry management")
     reg_sub = reg_p.add_subparsers(dest="reg_action")
+    reg_sub.add_parser("status", help="Show registry status (last announce age, etc.)")
     reg_sub.add_parser("discover", help="Query registry for gateways")
     reg_connect = reg_sub.add_parser("connect", help="Connect to a discovered gateway")
     reg_connect.add_argument("reg_identity", help="Identity hash (or unique 8+ char prefix)")

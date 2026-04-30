@@ -751,6 +751,12 @@ def _build_tui(sock_path: str, refresh_interval: float = 5.0,
             height: auto;
         }
 
+        #sidebar-announce-btn {
+            dock: bottom;
+            width: 100%;
+            margin-top: 1;
+        }
+
         /* ── Section headers ── */
         .section-header {
             height: 1;
@@ -1057,6 +1063,7 @@ def _build_tui(sock_path: str, refresh_interval: float = 5.0,
             with Horizontal():
                 with Vertical(id="sidebar"):
                     yield SidebarStats(id="sidebar-stats")
+                    yield Button("Announce Now", id="sidebar-announce-btn", variant="primary")
                 with TabbedContent():
                     with TabPane("Overview", id="overview"):
                         yield OverviewTab()
@@ -2064,6 +2071,8 @@ def _build_tui(sock_path: str, refresh_interval: float = 5.0,
                 self._handle_registry_publish_toggle()
             elif button_id == "registry-autoconnect-btn":
                 self._handle_registry_autoconnect_toggle()
+            elif button_id == "sidebar-announce-btn":
+                self._handle_registry_announce_now()
             elif button_id == "console-clear-btn":
                 self._console_lines.clear()
                 try:
@@ -2262,6 +2271,19 @@ def _build_tui(sock_path: str, refresh_interval: float = 5.0,
                     state = "enabled" if not currently_enabled else "disabled"
                     self.notify(f"Registry {state}", severity="information")
                     self.refresh_data()
+                else:
+                    self.notify(f"Error: {resp.get('error', '?')}", severity="error")
+            except Exception as e:
+                self.notify(f"Error: {e}", severity="error")
+
+        @work(thread=True)
+        def _handle_registry_announce_now(self) -> None:
+            """Send a one-shot announce to the registry. Returns immediately;
+            the daemon runs the actual announce on a worker thread."""
+            try:
+                resp = self._send("registry", {"action": "register"})
+                if resp.get("ok"):
+                    self.notify("Announce queued", severity="information")
                 else:
                     self.notify(f"Error: {resp.get('error', '?')}", severity="error")
             except Exception as e:

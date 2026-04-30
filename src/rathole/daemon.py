@@ -1098,15 +1098,21 @@ class RatholeDaemon:
                     "count": len(entries),
                 }
             elif action == "register":
-                ok = self.registry.register()
-                if not ok:
-                    return {"ok": False, "error": "Announce failed"}
-                return {"ok": True}
+                # Run on a worker thread so RNS announce() can never block the
+                # control socket. register() handles its own errors and logging.
+                threading.Thread(
+                    target=self.registry.register,
+                    daemon=True,
+                    name="rat-register",
+                ).start()
+                return {"ok": True, "queued": True}
             elif action == "deregister":
-                ok = self.registry.deregister()
-                if not ok:
-                    return {"ok": False, "error": "Deregister failed"}
-                return {"ok": True}
+                threading.Thread(
+                    target=self.registry.deregister,
+                    daemon=True,
+                    name="rat-deregister",
+                ).start()
+                return {"ok": True, "queued": True}
             elif action == "connect":
                 identity_hash = args.get("identity_hash", "")
                 if not identity_hash:
@@ -1375,6 +1381,13 @@ class RatholeDaemon:
         for key in ("enabled", "publish", "discover", "auto_connect"):
             if key in args:
                 reg_cfg[key] = bool(args[key])
+
+        for key in ("announce_interval", "discover_interval"):
+            if key in args:
+                try:
+                    reg_cfg[key] = max(10, int(args[key]))
+                except (TypeError, ValueError):
+                    pass
 
         self.registry.refresh_config(reg_cfg)
 
