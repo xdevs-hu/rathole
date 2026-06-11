@@ -103,6 +103,20 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "max_resource_bytes": 16_777_216,
             "max_active_per_interface": 10,
         },
+        # ── LoRa-specific filters ────────────────────────────
+        "lora_snr": {
+            "enabled": False,
+            "min_snr": -10.0,
+            "min_rssi": None,
+            "action": "drop",
+        },
+        "lora_airtime": {
+            "enabled": False,
+            "duty_cycle_percent": 1.0,
+            "window_seconds": 3600,
+            "spreading_factor": 8,
+            "bandwidth_hz": 125_000,
+        },
     },
     "reputation": {
         "enabled": True,
@@ -170,6 +184,21 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "exclude_identities": [],
         "request_timeout": 10,
     },
+    "lora": {
+        "enabled": False,
+        # Duty-cycle enforcement (legal requirement on many LoRa bands)
+        "duty_cycle_percent": 1.0,      # EU 868 MHz legal limit: 1% per hour
+        "duty_cycle_window": 3600,      # Rolling window in seconds (1 hour)
+        # SNR quality gate
+        "min_snr": -10.0,               # dB — drop packets below this SNR
+        "min_rssi": None,               # dBm — optional RSSI gate (None = disabled)
+        "snr_action": "drop",           # "drop" or "flag"
+        # Radio parameters used for airtime estimation when bitrate is unknown
+        "spreading_factor": 8,          # SF7–SF12
+        "bandwidth_hz": 125_000,        # 125 kHz standard
+        # TX power cap (informational — enforced at RNS config level)
+        "max_tx_power": 17,             # dBm
+    },
 }
 
 
@@ -231,6 +260,9 @@ class RatholeConfig:
     def registry(self) -> dict:
         return self.raw.get("registry", {})
 
+    @property
+    def lora(self) -> dict:
+        return self.raw.get("lora", {})
 
     @property
     def node_mode(self) -> str:
@@ -293,6 +325,11 @@ def _validate(raw: dict) -> dict:
         ("resource_guard", "max_resource_bytes", 1, None, 16_777_216),
         ("resource_guard", "max_active_per_interface", 1, None, 10),
         ("announce_size", "max_app_data_bytes", 1, None, 500),
+        # LoRa filters
+        ("lora_snr", "min_snr", -30.0, 10.0, -10.0),
+        ("lora_airtime", "duty_cycle_percent", 0.01, 100.0, 1.0),
+        ("lora_airtime", "window_seconds", 60, 86400, 3600),
+        ("lora_airtime", "spreading_factor", 7, 12, 8),
     ]
 
     for section, key, min_val, max_val, default in _checks:

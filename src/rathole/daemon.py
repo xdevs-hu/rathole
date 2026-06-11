@@ -848,6 +848,8 @@ class RatholeDaemon:
             from .i2p import get_i2p_b32_from_transport, has_i2p_interface
             stats["i2p_b32"] = get_i2p_b32_from_transport()
             stats["i2p_pending"] = has_i2p_interface() and not stats["i2p_b32"]
+            from .lora import detect_lora_interfaces
+            stats["lora_interfaces"] = detect_lora_interfaces()
             peers = self._enrich_peers(self.state.peer_summary())
             return {
                 "ok": True,
@@ -1070,6 +1072,19 @@ class RatholeDaemon:
             except (ValueError, TypeError):
                 return {"ok": False, "error": "port must be 1-65535"}
             return self._add_tcp_server_interface(listen_ip, port)
+        elif cmd == "add_lora_interface":
+            port = args.get("port", "").strip()
+            if not port:
+                return {"ok": False, "error": "port required (e.g. /dev/ttyUSB0 or COM3)"}
+            try:
+                frequency = int(args.get("frequency", 868_000_000))
+                bandwidth = int(args.get("bandwidth", 125_000))
+                txpower = int(args.get("txpower", 17))
+                sf = int(args.get("spreading_factor", 8))
+                cr = int(args.get("coding_rate", 5))
+            except (TypeError, ValueError) as e:
+                return {"ok": False, "error": f"Invalid radio parameter: {e}"}
+            return self._add_lora_interface(port, frequency, bandwidth, txpower, sf, cr)
         elif cmd == "add_i2p_server":
             return self._add_i2p_server_interface()
         elif cmd == "add_i2p_peer":
@@ -1310,6 +1325,92 @@ class RatholeDaemon:
                 log.info("Persisted I2P peer %s to %s", name, config_file)
         except Exception as e:
             log.warning("I2P peer active but failed to persist: %s", e)
+
+    def _add_lora_interface(
+        self,
+        port: str,
+        frequency: int = 868_000_000,
+        bandwidth: int = 125_000,
+        txpower: int = 17,
+        spreading_factor: int = 8,
+        coding_rate: int = 5,
+    ) -> dict:
+        """Add an RNodeInterface (LoRa) at runtime."""
+        try:
+            import RNS
+            from RNS.Interfaces.RNodeInterface import RNodeInterface
+
+            name = f"LoRa {port}"
+            # Duplicate check
+            for iface in RNS.Transport.interfaces:
+                if getattr(iface, "name", "") == name:
+                    return {"ok": False, "error": f"LoRa interface on {port} already active"}
+
+            config = {
+                "name": name,
+                "port": port,
+                "frequency": str(frequency),
+                "bandwidth": str(bandwidth),
+                "txpower": str(txpower),
+                "spreadingfactor": str(spreading_factor),
+                "codingrate": str(coding_rate),
+                "enabled": "yes",
+            }
+            interface = RNodeInterface(RNS.Transport, config)
+            self._rns_instance._add_interface(interface)
+            log.info(
+                "Added LoRa interface: %s (freq=%d Hz, SF%d, BW=%d Hz, %d dBm)",
+                name, frequency, spreading_factor, bandwidth, txpower,
+            )
+
+            self._persist_lora_interface(name, port, frequency, bandwidth, txpower, spreading_factor, coding_rate)
+
+            return {
+                "ok": True,
+                "name": name,
+                "port": port,
+                "frequency": frequency,
+                "bandwidth": bandwidth,
+                "txpower": txpower,
+                "spreading_factor": spreading_factor,
+                "coding_rate": coding_rate,
+            }
+        except ImportError:
+            return {"ok": False, "error": "RNodeInterface not available in this RNS version"}
+        except Exception as e:
+            log.error("Failed to add LoRa interface on %s: %s", port, e)
+            return {"ok": False, "error": str(e)}
+
+    def _persist_lora_interface(
+        self,
+        name: str,
+        port: str,
+        frequency: int,
+        bandwidth: int,
+        txpower: int,
+        spreading_factor: int,
+        coding_rate: int,
+    ):
+        """Write the RNodeInterface to the RNS config file for persistence."""
+        try:
+            from .lora import add_rns_rnode_interface
+            rns_config_path = self.config.general.get("reticulum_config_path", "") or None
+            if rns_config_path:
+                config_file = Path(rns_config_path) / "config"
+            else:
+                config_file = Path.home() / ".reticulum" / "config"
+            if config_file.exists():
+                add_rns_rnode_interface(
+                    config_file, name, port,
+                    frequency=frequency,
+                    bandwidth=bandwidth,
+                    txpower=txpower,
+                    spreadingfactor=spreading_factor,
+                    codingrate=coding_rate,
+                )
+                log.info("Persisted LoRa interface %s to %s", name, config_file)
+        except Exception as e:
+            log.warning("LoRa interface active but failed to persist: %s", e)
 
     def _propagate_config(self):
         """Push current config to all subsystems that cache config values."""

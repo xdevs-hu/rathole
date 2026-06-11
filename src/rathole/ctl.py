@@ -1283,6 +1283,11 @@ def cmd_setup(args):
 
     console.print()
 
+    # LoRa support (optional)
+    _setup_lora(rns_config_file, console)
+
+    console.print()
+
     # Gateway Registry (requires I2P)
     registry_enabled = False
     registry_publish = False
@@ -1542,6 +1547,119 @@ def _setup_add_interfaces(rns_config_file: Path, console, lead_with: str = "clie
                 add_interfaces = False
         else:
             add_interfaces = False
+
+
+def _setup_lora(rns_config_file: Path, console) -> bool:
+    """Ask whether to configure a LoRa (RNode) interface.
+
+    Scans for serial ports, prompts for radio parameters, and writes
+    an RNodeInterface section to the RNS config.
+
+    Returns True if a LoRa interface was configured.
+    """
+    from .lora import detect_serial_ports, add_rns_rnode_interface, FREQUENCY_PRESETS, DEFAULT_RNODE_PARAMS
+
+    console.print("[bold]── Step 3b: LoRa Interface (optional) ──[/]\n")
+    console.print("  [dim]Connect an RNode or other LoRa hardware for radio mesh bridging.[/]")
+    console.print("  [dim]Requires an RNode device connected via USB/serial.[/]")
+    console.print()
+
+    if not Confirm.ask("  Add a LoRa (RNode) interface?", default=False):
+        return False
+
+    console.print()
+
+    # Detect available serial ports
+    ports = detect_serial_ports()
+    if ports:
+        console.print("  Detected serial ports:")
+        for i, p in enumerate(ports, 1):
+            console.print(f"    [bold]{i}.[/] {p}")
+        console.print()
+        default_port = ports[0]
+    else:
+        console.print("  [dim]No serial ports detected automatically.[/]")
+        default_port = "/dev/ttyUSB0"
+
+    port = Prompt.ask("  Serial port", default=default_port)
+
+    # Frequency selection
+    console.print()
+    console.print("  Common LoRa frequencies:")
+    freq_map = {}
+    for i, (label, hz) in enumerate(FREQUENCY_PRESETS.items(), 1):
+        console.print(f"    [bold]{i}.[/] {label} ({hz:,} Hz)")
+        freq_map[str(i)] = hz
+    console.print(f"    [bold]{len(freq_map)+1}.[/] Custom")
+
+    freq_choice = Prompt.ask(
+        "  Frequency",
+        choices=list(freq_map.keys()) + [str(len(freq_map) + 1)],
+        default="1",
+    )
+    if freq_choice in freq_map:
+        frequency = freq_map[freq_choice]
+    else:
+        freq_str = Prompt.ask("  Enter frequency in Hz", default=str(DEFAULT_RNODE_PARAMS["frequency"]))
+        try:
+            frequency = int(freq_str)
+        except ValueError:
+            console.print("  [red]Invalid frequency — using 868 MHz default[/]")
+            frequency = DEFAULT_RNODE_PARAMS["frequency"]
+
+    # Spreading factor
+    console.print()
+    console.print("  [dim]Spreading Factor: higher = longer range, slower speed[/]")
+    console.print("  [dim]SF7=fastest, SF12=longest range. SF8 is a good default.[/]")
+    sf_str = Prompt.ask("  Spreading Factor (7-12)", default=str(DEFAULT_RNODE_PARAMS["spreadingfactor"]))
+    try:
+        sf = max(7, min(12, int(sf_str)))
+    except ValueError:
+        sf = DEFAULT_RNODE_PARAMS["spreadingfactor"]
+
+    # Bandwidth
+    console.print()
+    bw_choices = {"1": 125_000, "2": 250_000, "3": 500_000}
+    console.print("  Bandwidth:")
+    console.print("    [bold]1.[/] 125 kHz (standard, best range)")
+    console.print("    [bold]2.[/] 250 kHz (faster, less range)")
+    console.print("    [bold]3.[/] 500 kHz (fastest, shortest range)")
+    bw_choice = Prompt.ask("  Bandwidth", choices=["1", "2", "3"], default="1")
+    bandwidth = bw_choices[bw_choice]
+
+    # TX power
+    console.print()
+    txpower_str = Prompt.ask(
+        "  TX Power in dBm (2-17, 17=max)",
+        default=str(DEFAULT_RNODE_PARAMS["txpower"]),
+    )
+    try:
+        txpower = max(2, min(17, int(txpower_str)))
+    except ValueError:
+        txpower = DEFAULT_RNODE_PARAMS["txpower"]
+
+    # Interface name
+    iface_name = f"LoRa {port}"
+
+    # Write to RNS config
+    _ensure_rns_config(rns_config_file)
+    try:
+        add_rns_rnode_interface(
+            rns_config_file, iface_name, port,
+            frequency=frequency,
+            bandwidth=bandwidth,
+            txpower=txpower,
+            spreadingfactor=sf,
+            codingrate=DEFAULT_RNODE_PARAMS["codingrate"],
+        )
+        console.print()
+        console.print(f"  [green]✓[/] LoRa interface configured: [bold]{iface_name}[/]")
+        console.print(f"  [dim]Freq: {frequency/1e6:.3f} MHz  SF{sf}  BW: {bandwidth//1000} kHz  TX: {txpower} dBm[/]")
+        console.print("  [dim]Apply the 'lora' preset for LoRa-optimized security settings.[/]")
+        return True
+    except Exception as e:
+        console.print(f"  [red]✗[/] Failed to write LoRa interface: {e}")
+        return False
 
 
 def _setup_i2p(rns_config_file: Path, console, node_mode: str) -> bool:
@@ -1967,9 +2085,48 @@ def cmd_network(args):
         return 0
 
     elif action == "add":
-        mode = args.net_mode  # "server" or "client"
-        target = args.net_target  # "host:port"
+        mode = args.net_mode  # "server", "client", or "lora"
+        target = args.net_target
 
+        # ── LoRa (RNode) interface ────────────────────────────────
+        if mode == "lora":
+            port = target  # serial port path, e.g. /dev/ttyUSB0
+            frequency = getattr(args, "frequency", 868_000_000)
+            bandwidth = getattr(args, "bandwidth", 125_000)
+            txpower = getattr(args, "txpower", 17)
+            sf = getattr(args, "spreading_factor", 8)
+            cr = getattr(args, "coding_rate", 5)
+
+            name = f"LoRa {port}"
+            _ensure_rns_config(rns_config)
+
+            from .lora import add_rns_rnode_interface
+            add_rns_rnode_interface(
+                rns_config, name, port,
+                frequency=frequency,
+                bandwidth=bandwidth,
+                txpower=txpower,
+                spreadingfactor=sf,
+                codingrate=cr,
+            )
+
+            if not _check_rns_transport(rns_config):
+                _set_rns_transport(rns_config, True)
+                console.print("[yellow]Transport was disabled — enabled automatically.[/]")
+
+            if _json_mode:
+                _output_json({"ok": True, "name": name, "port": port,
+                              "frequency": frequency, "bandwidth": bandwidth,
+                              "txpower": txpower, "spreading_factor": sf})
+                return 0
+
+            console.print(f"[green]✓[/] Added [cyan]{name}[/] to {rns_config}")
+            console.print(f"  [dim]Freq: {frequency/1e6:.3f} MHz  SF{sf}  BW: {bandwidth//1000} kHz  TX: {txpower} dBm[/]")
+            console.print("[dim]Restart Rathole to activate the new interface.[/]")
+            console.print("[dim]Tip: apply the 'lora' preset for LoRa-optimized security settings.[/]")
+            return 0
+
+        # ── TCP interface ─────────────────────────────────────────
         if ":" not in target:
             console.print("[red]Error:[/] Target must be host:port (e.g. 0.0.0.0:4242)")
             return 1
@@ -2197,10 +2354,22 @@ def main():
     net_p.add_argument("--rns-config", default="", help="Path to RNS config file")
     net_sub = net_p.add_subparsers(dest="net_action")
 
-    net_add = net_sub.add_parser("add", help="Add a TCP interface")
-    net_add.add_argument("net_mode", choices=["server", "client"],
-                         help="server (public gateway) or client (connect to gateway)")
-    net_add.add_argument("net_target", help="host:port (e.g. 0.0.0.0:4242 or rns.example.org:4242)")
+    net_add = net_sub.add_parser("add", help="Add a TCP or LoRa interface")
+    net_add.add_argument("net_mode", choices=["server", "client", "lora"],
+                         help="server (TCP listener), client (TCP connect), or lora (RNode)")
+    net_add.add_argument("net_target",
+                         help="host:port for TCP, or serial port for lora (e.g. /dev/ttyUSB0)")
+    # LoRa-specific optional args
+    net_add.add_argument("--frequency", type=int, default=868_000_000,
+                         help="LoRa frequency in Hz (default: 868000000)")
+    net_add.add_argument("--bandwidth", type=int, default=125_000,
+                         help="LoRa bandwidth in Hz (default: 125000)")
+    net_add.add_argument("--txpower", type=int, default=17,
+                         help="LoRa TX power in dBm (default: 17)")
+    net_add.add_argument("--sf", "--spreading-factor", dest="spreading_factor", type=int, default=8,
+                         help="LoRa spreading factor 7-12 (default: 8)")
+    net_add.add_argument("--cr", "--coding-rate", dest="coding_rate", type=int, default=5,
+                         help="LoRa coding rate denominator 5-8 (default: 5 = 4/5)")
 
     net_rm = net_sub.add_parser("remove", help="Remove a named interface")
     net_rm.add_argument("net_name", help="Interface name (from 'rat network')")

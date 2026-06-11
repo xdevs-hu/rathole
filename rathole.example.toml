@@ -333,6 +333,59 @@ max_active_per_interface = 10
 
 
 # ═══════════════════════════════════════════════════════════════════
+# LORA FILTERS — applied only to LoRa interfaces (self-skip on TCP/IP)
+# ═══════════════════════════════════════════════════════════════════
+
+
+# ─── L2. LoRa SNR Quality Gate ────────────────────────────────
+#
+# Drops packets received below a minimum SNR threshold on LoRa interfaces.
+# Only active when the receiving interface reports SNR (RNodeInterface).
+# TCP/IP interfaces always pass through — SNR is None for them.
+
+[filters.lora_snr]
+enabled = false
+
+# Minimum acceptable SNR in dB. Packets below this are dropped.
+# -10 dB is conservative (near LoRa noise floor is ~-20 dB).
+min_snr = -10.0
+
+# Optional minimum RSSI in dBm. Null = disabled.
+# min_rssi = -120.0
+
+# Action when SNR is too low: "drop" or "flag" (log only, don't drop).
+action = "drop"
+
+
+# ─── L3. LoRa Airtime / Duty-Cycle Budget ─────────────────────
+#
+# Enforces the legal duty-cycle limit for LoRa interfaces.
+# Tracks cumulative on-air time per interface using a rolling window.
+# Drops packets that would cause the interface to exceed its budget.
+#
+# EU 868 MHz: legally limited to 1% duty cycle (36 seconds per hour).
+# Only active on LoRa interfaces (bitrate < 50 Kbps or SNR present).
+
+[filters.lora_airtime]
+enabled = false
+
+# Maximum duty cycle percentage.
+# 1.0 = 1% = EU 868 MHz legal limit (36 seconds per hour).
+duty_cycle_percent = 1.0
+
+# Rolling window in seconds for duty-cycle calculation.
+window_seconds = 3600
+
+# LoRa spreading factor for airtime estimation (7-12).
+# Must match your RNode configuration.
+spreading_factor = 8
+
+# LoRa bandwidth in Hz for airtime estimation.
+# Must match your RNode configuration.
+bandwidth_hz = 125_000
+
+
+# ═══════════════════════════════════════════════════════════════════
 # INTELLIGENCE — reputation, adaptive thresholds, correlation
 # ═══════════════════════════════════════════════════════════════════
 
@@ -514,6 +567,79 @@ enabled = false
 # action = "webhook"
 # action_target = "https://hooks.example.com/rathole"
 # cooldown = 600
+
+
+# ─── LoRa Interface Support ──────────────────────────────────────
+#
+# Rathole can bridge LoRa (RNode) and TCP/IP interfaces simultaneously.
+# When an RNodeInterface is configured in your Reticulum config, Rathole
+# automatically detects it and applies LoRa-specific security controls.
+#
+# Add an RNode interface:
+#   rat network add lora /dev/ttyUSB0 --frequency 868000000 --sf 8
+#
+# Or use the setup wizard:
+#   rat setup   (includes a LoRa interface step)
+#
+# Apply the lora preset for LoRa-optimized security settings:
+#   rat config preset apply lora
+#
+# The lora_snr and lora_airtime filters are no-ops on TCP/IP interfaces —
+# they only activate when a packet arrives on a LoRa interface (SNR present
+# or bitrate < 50 Kbps). TCP/IP traffic is never affected.
+
+[lora]
+
+# Enable LoRa-specific security features (SNR gate + duty-cycle enforcement).
+# Set to true when you have an RNodeInterface configured in Reticulum.
+enabled = false
+
+# ── Duty-cycle enforcement ────────────────────────────────────────
+#
+# LoRa is legally limited to 1% duty cycle on EU 868 MHz band.
+# Rathole tracks cumulative on-air time per interface and drops packets
+# that would exceed the budget. Airtime is estimated from packet size
+# and the spreading_factor/bandwidth_hz parameters below.
+
+# Maximum duty cycle percentage (1.0 = 1% = EU 868 MHz legal limit).
+duty_cycle_percent = 1.0
+
+# Rolling window in seconds for duty-cycle calculation.
+# 3600 = 1 hour (standard EU measurement window).
+duty_cycle_window = 3600
+
+# ── SNR quality gate ──────────────────────────────────────────────
+#
+# Drop packets received below this SNR threshold. Very low SNR packets
+# are likely corrupted or from nodes at the extreme edge of radio range.
+# Only active when the receiving interface reports SNR (LoRa interfaces).
+
+# Minimum acceptable SNR in dB. Packets below this are dropped.
+# Typical values: -10 dB (conservative), -5 dB (moderate), 0 dB (strict)
+min_snr = -10.0
+
+# Optional minimum RSSI in dBm. Set to null to disable.
+# Example: min_rssi = -120.0
+min_rssi = null  # disabled
+
+# Action when SNR/RSSI is too low: "drop" or "flag" (log only).
+snr_action = "drop"
+
+# ── Radio parameters for airtime estimation ───────────────────────
+#
+# Used when interface bitrate is not available from RNS.
+# Set these to match your RNode configuration for accurate airtime tracking.
+
+# LoRa spreading factor (7-12). Must match your RNode config.
+# SF7=fastest/shortest range, SF12=slowest/longest range.
+spreading_factor = 8
+
+# LoRa bandwidth in Hz. Must match your RNode config.
+# Common values: 125000 (125 kHz), 250000, 500000
+bandwidth_hz = 125_000
+
+# TX power cap in dBm (informational — enforced at RNS/RNode level).
+max_tx_power = 17
 
 
 # ─── Gateway Registry ──────────────────────────────────────────

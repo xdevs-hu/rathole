@@ -208,11 +208,33 @@ _LORA: dict = {
         "path_request": {"enabled": True, "max_per_minute": 10, "scan_threshold": 5, "scan_window": 120},
         "link_request": {"enabled": True, "refill_rate": 0.2, "burst": 3, "max_pending_per_interface": 10},
         "resource_guard": {"enabled": True, "max_resource_bytes": 1_048_576, "max_active_per_interface": 3},
+        # LoRa-specific filters — enabled in this preset
+        "lora_snr": {
+            "enabled": True,
+            "min_snr": -10.0,       # Drop packets below -10 dB SNR
+            "min_rssi": None,       # RSSI gate disabled by default
+            "action": "drop",
+        },
+        "lora_airtime": {
+            "enabled": True,
+            "duty_cycle_percent": 1.0,   # EU 868 MHz legal limit
+            "window_seconds": 3600,      # 1-hour rolling window
+            "spreading_factor": 8,       # SF8 default — adjust to match your RNode config
+            "bandwidth_hz": 125_000,     # 125 kHz standard
+        },
     },
     "reputation": {"enabled": True, "auto_blackhole": False},
     "adaptive": {"enabled": True, "learning_hours": 24},  # Longer baseline for LoRa
     "correlator": {"enabled": True, "sybil_threshold": 10, "response_mode": "defensive", "grace_period": 600},
     "registry": {"enabled": False},
+    "lora": {
+        "enabled": True,
+        "duty_cycle_percent": 1.0,
+        "duty_cycle_window": 3600,
+        "min_snr": -10.0,
+        "spreading_factor": 8,
+        "bandwidth_hz": 125_000,
+    },
 }
 
 

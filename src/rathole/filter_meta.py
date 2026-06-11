@@ -33,7 +33,7 @@ class FilterInfo:
 
 # ── Pipeline → filter ordering ──────────────────────────────────
 
-PIPELINE_ORDER = ["global", "announce", "path", "link", "data"]
+PIPELINE_ORDER = ["global", "announce", "path", "link", "data", "lora"]
 
 PIPELINE_FILTERS: dict[str, list[str]] = {
     "global":   ["interface_rate", "bandwidth", "packet_size"],
@@ -41,6 +41,7 @@ PIPELINE_FILTERS: dict[str, list[str]] = {
     "path":     ["path_request"],
     "link":     ["link_request"],
     "data":     ["resource_guard"],
+    "lora":     ["lora_snr", "lora_airtime"],
 }
 
 PIPELINE_LABELS: dict[str, str] = {
@@ -49,6 +50,7 @@ PIPELINE_LABELS: dict[str, str] = {
     "path":     "Path Request",
     "link":     "Link Request",
     "data":     "Data / Resource",
+    "lora":     "LoRa (radio interfaces only)",
 }
 
 
@@ -179,6 +181,31 @@ FILTER_META: dict[str, FilterInfo] = {
         params={
             "max_resource_bytes": ParamInfo(label="Max Size (bytes)", step=1000),
             "max_active_per_interface": ParamInfo(label="Max Active", step=1),
+        },
+    ),
+    "lora_snr": FilterInfo(
+        name="lora_snr",
+        label="LoRa SNR Gate",
+        pipeline="lora",
+        description="Drop LoRa packets below minimum SNR threshold (no-op on TCP/IP)",
+        params={
+            "min_snr": ParamInfo(label="Min SNR (dB)", step=0.5),
+            "action": ParamInfo(
+                label="Action", type="select",
+                options=("drop", "flag"),
+            ),
+        },
+    ),
+    "lora_airtime": FilterInfo(
+        name="lora_airtime",
+        label="LoRa Airtime Budget",
+        pipeline="lora",
+        description="Enforce LoRa duty-cycle limit (EU: 1%/hour) — no-op on TCP/IP",
+        params={
+            "duty_cycle_percent": ParamInfo(label="Duty Cycle %", step=0.1),
+            "window_seconds": ParamInfo(label="Window (s)", step=60),
+            "spreading_factor": ParamInfo(label="Spreading Factor", step=1),
+            "bandwidth_hz": ParamInfo(label="Bandwidth (Hz)", step=1000),
         },
     ),
 }

@@ -11,6 +11,8 @@ Filters are organized into registries by pipeline scope:
 - PATH_REQUEST_FILTER_REGISTRY: Applied to path requests only
 - LINK_REQUEST_FILTER_REGISTRY: Applied to LINKREQUEST packets only
 - DATA_FILTER_REGISTRY: Applied to DATA/PROOF packets only
+- LORA_FILTER_REGISTRY: Applied to all packets on LoRa interfaces
+  (these filters self-skip on non-LoRa interfaces)
 
 The legacy FILTER_REGISTRY is the announce pipeline for backward
 compatibility with v0.1.
@@ -39,6 +41,11 @@ from .path_request import PathRequestFilter
 from .link_request import LinkRequestFilter
 from .resource_guard import ResourceGuardFilter
 
+# ── LoRa-specific filters ────────────────────────────────────────
+
+from .lora_airtime import LoRaAirtimeFilter
+from .lora_snr import LoRaSNRFilter
+
 
 # ── Registries ───────────────────────────────────────────────────
 #
@@ -50,6 +57,9 @@ GLOBAL_FILTER_REGISTRY: list[tuple[str, type[BaseFilter]]] = [
     ("interface_rate", InterfaceRateLimitFilter),
     ("bandwidth",      BandwidthFilter),
     ("packet_size",    PacketSizeFilter),
+    # LoRa filters run globally but self-skip on non-LoRa interfaces
+    ("lora_snr",       LoRaSNRFilter),
+    ("lora_airtime",   LoRaAirtimeFilter),
 ]
 
 ANNOUNCE_FILTER_REGISTRY: list[tuple[str, type[BaseFilter]]] = [
@@ -73,6 +83,12 @@ DATA_FILTER_REGISTRY: list[tuple[str, type[BaseFilter]]] = [
     ("resource_guard", ResourceGuardFilter),
 ]
 
+# Convenience registry for LoRa-specific filters (subset of GLOBAL)
+LORA_FILTER_REGISTRY: list[tuple[str, type[BaseFilter]]] = [
+    ("lora_snr",       LoRaSNRFilter),
+    ("lora_airtime",   LoRaAirtimeFilter),
+]
+
 # Legacy alias — the announce pipeline for backward compatibility
 FILTER_REGISTRY = ANNOUNCE_FILTER_REGISTRY
 
@@ -94,6 +110,9 @@ __all__ = [
     "PathRequestFilter",
     "LinkRequestFilter",
     "ResourceGuardFilter",
+    # LoRa filters
+    "LoRaAirtimeFilter",
+    "LoRaSNRFilter",
     # Registries
     "FILTER_REGISTRY",
     "GLOBAL_FILTER_REGISTRY",
@@ -101,4 +120,5 @@ __all__ = [
     "PATH_REQUEST_FILTER_REGISTRY",
     "LINK_REQUEST_FILTER_REGISTRY",
     "DATA_FILTER_REGISTRY",
+    "LORA_FILTER_REGISTRY",
 ]

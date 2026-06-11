@@ -129,6 +129,17 @@ def _extract_context_from_raw(raw: bytes, receiving_interface) -> PacketContext:
             if hasattr(receiving_interface, "ic_burst_active"):
                 kwargs["interface_burst_active"] = bool(receiving_interface.ic_burst_active)
 
+            # ── LoRa radio metadata ───────────────────────────────
+            # RNodeInterface exposes rssi and snr as instance attributes
+            # updated per-packet. These are None on non-LoRa interfaces.
+            for _attr, _key in (("rssi", "rssi"), ("snr", "snr"), ("q", "quality")):
+                _val = getattr(receiving_interface, _attr, None)
+                if _val is not None:
+                    try:
+                        kwargs[_key] = float(_val)
+                    except (TypeError, ValueError):
+                        pass
+
             # Peer identity
             peer_hash = ""
             if hasattr(receiving_interface, "remote_identity"):
