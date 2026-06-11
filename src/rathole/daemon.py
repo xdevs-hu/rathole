@@ -28,6 +28,18 @@ from .registry import RegistryClient
 log = logging.getLogger("rathole.daemon")
 
 
+def _default_rns_dir() -> Path:
+    """Return the default Reticulum config directory.
+
+    Falls back to ``/var/lib/rathole/.reticulum`` when the process has no
+    home directory (e.g. a system user created without ``-m`` in Docker).
+    """
+    try:
+        return Path.home() / ".reticulum"
+    except RuntimeError:
+        return Path("/var/lib/rathole/.reticulum")
+
+
 class RatholeDaemon:
     """
     Main daemon process.
@@ -438,7 +450,7 @@ class RatholeDaemon:
         if rns_config_path:
             config_dir = Path(rns_config_path)
         else:
-            config_dir = Path.home() / ".reticulum"
+            config_dir = _default_rns_dir()
 
         config_file = config_dir / "config"
         if not config_file.exists():
@@ -1205,7 +1217,7 @@ class RatholeDaemon:
             if rns_config_path:
                 config_file = Path(rns_config_path) / "config"
             else:
-                config_file = Path.home() / ".reticulum" / "config"
+                config_file = _default_rns_dir() / "config"
             if config_file.exists():
                 _add_rns_tcp_interface(config_file, "server", name, listen_ip, port)
                 log.info("Persisted TCP server %s to %s", name, config_file)
@@ -1260,7 +1272,7 @@ class RatholeDaemon:
             if rns_config_path:
                 config_file = Path(rns_config_path) / "config"
             else:
-                config_file = Path.home() / ".reticulum" / "config"
+                config_file = _default_rns_dir() / "config"
             if config_file.exists():
                 add_rns_i2p_interface(config_file, name, connectable=True)
                 log.info("Persisted I2P server %s to %s", name, config_file)
@@ -1275,7 +1287,7 @@ class RatholeDaemon:
             if rns_config_path:
                 config_file = Path(rns_config_path) / "config"
             else:
-                config_file = Path.home() / ".reticulum" / "config"
+                config_file = _default_rns_dir() / "config"
             if config_file.exists():
                 _add_rns_tcp_interface(config_file, "client", name, host, port)
                 log.info("Persisted TCP interface %s to %s", name, config_file)
@@ -1319,7 +1331,7 @@ class RatholeDaemon:
             if rns_config_path:
                 config_file = Path(rns_config_path) / "config"
             else:
-                config_file = Path.home() / ".reticulum" / "config"
+                config_file = _default_rns_dir() / "config"
             if config_file.exists():
                 add_rns_i2p_interface(config_file, name, peers=[b32_address])
                 log.info("Persisted I2P peer %s to %s", name, config_file)
@@ -1398,7 +1410,7 @@ class RatholeDaemon:
             if rns_config_path:
                 config_file = Path(rns_config_path) / "config"
             else:
-                config_file = Path.home() / ".reticulum" / "config"
+                config_file = _default_rns_dir() / "config"
             if config_file.exists():
                 add_rns_rnode_interface(
                     config_file, name, port,

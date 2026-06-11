@@ -1,18 +1,30 @@
 version: "3.8"
 
 services:
+  i2pd:
+    image: purplei2p/i2pd:latest
+    container_name: i2pd
+    restart: unless-stopped
+    network_mode: host
+    volumes:
+      - i2pd-data:/home/i2pd/data
+    # SAM API listens on 127.0.0.1:7656 (host network, reachable by rathole)
+
   rathole:
     build:
       context: ..
       dockerfile: deploy/Dockerfile
     container_name: rathole
     restart: unless-stopped
+    depends_on:
+      - i2pd
     volumes:
       - rathole-state:/var/lib/rathole
       - ./rathole.toml:/etc/rathole/rathole.toml:ro
-    ports:
-      - "9777:9777"    # Prometheus metrics
+    # network_mode: host exposes all ports directly on the host —
+    # no ports: mapping needed. Prometheus metrics available at host:9777.
     network_mode: host  # Required for RNS transport access
 
 volumes:
   rathole-state:
+  i2pd-data:

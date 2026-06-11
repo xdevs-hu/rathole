@@ -540,6 +540,11 @@ def _build_tui(sock_path: str, refresh_interval: float = 5.0,
                 yield Input(placeholder="I2P B32 address", id="i2p-b32-input")
                 yield Button("Connect I2P", id="i2p-connect-btn", variant="success")
                 yield Button("Start I2P Server", id="i2p-server-btn", variant="primary")
+            with Horizontal(id="lora-add-form"):
+                yield Input(placeholder="Serial port (e.g. /dev/ttyUSB0)", id="lora-port-input")
+                yield Input(placeholder="Freq Hz (e.g. 868000000)", id="lora-freq-input")
+                yield Input(placeholder="SF 7-12 (default 8)", id="lora-sf-input")
+                yield Button("Add LoRa", id="lora-add-btn", variant="warning")
             yield Static(id="i2p-b32-display")
             yield Button("Copy", id="i2p-b32-copy-btn", variant="default")
             yield DataTable(id="interface-table")
@@ -768,7 +773,7 @@ def _build_tui(sock_path: str, refresh_interval: float = 5.0,
         }
 
         /* ── Peer actions / event filters / blackhole form / interface form ── */
-        #peer-actions, #event-filters, #bh-add-form, #iface-add-form, #i2p-add-form, #registry-btn-form {
+        #peer-actions, #event-filters, #bh-add-form, #iface-add-form, #i2p-add-form, #lora-add-form, #registry-btn-form {
             height: 3;
             padding: 0 1;
         }
@@ -805,11 +810,11 @@ def _build_tui(sock_path: str, refresh_interval: float = 5.0,
             padding: 0 1;
         }
 
-        #peer-actions Input, #event-filters Input, #bh-add-form Input, #iface-add-form Input, #i2p-add-form Input {
+        #peer-actions Input, #event-filters Input, #bh-add-form Input, #iface-add-form Input, #i2p-add-form Input, #lora-add-form Input {
             width: 1fr;
         }
 
-        #peer-actions Button, #bh-add-form Button, #iface-add-form Button, #i2p-add-form Button {
+        #peer-actions Button, #bh-add-form Button, #iface-add-form Button, #i2p-add-form Button, #lora-add-form Button {
             margin-left: 1;
         }
 
@@ -2061,6 +2066,8 @@ def _build_tui(sock_path: str, refresh_interval: float = 5.0,
                 self._handle_i2p_connect()
             elif button_id == "i2p-server-btn":
                 self._handle_i2p_server()
+            elif button_id == "lora-add-btn":
+                self._handle_lora_add()
             elif button_id == "i2p-b32-copy-btn":
                 self._handle_i2p_copy()
             elif button_id == "registry-toggle-btn":
@@ -2203,6 +2210,54 @@ def _build_tui(sock_path: str, refresh_interval: float = 5.0,
                     self.notify(f"Listening: {name}", severity="information")
                     self.call_from_thread(lambda: host_input.__setattr__("value", ""))
                     self.call_from_thread(lambda: port_input.__setattr__("value", ""))
+                    self.refresh_data()
+                else:
+                    self.notify(f"Error: {resp.get('error', '?')}", severity="error")
+            except Exception as e:
+                self.notify(f"Error: {e}", severity="error")
+
+        @work(thread=True)
+        def _handle_lora_add(self) -> None:
+            try:
+                port_input = self.query_one("#lora-port-input", Input)
+                freq_input = self.query_one("#lora-freq-input", Input)
+                sf_input = self.query_one("#lora-sf-input", Input)
+
+                port = port_input.value.strip()
+                if not port:
+                    self.notify("Serial port required (e.g. /dev/ttyUSB0)", severity="error")
+                    return
+
+                try:
+                    frequency = int(freq_input.value.strip()) if freq_input.value.strip() else 868_000_000
+                except ValueError:
+                    self.notify("Frequency must be an integer in Hz (e.g. 868000000)", severity="error")
+                    return
+
+                try:
+                    sf = int(sf_input.value.strip()) if sf_input.value.strip() else 8
+                    if not (7 <= sf <= 12):
+                        raise ValueError
+                except ValueError:
+                    self.notify("Spreading factor must be 7–12", severity="error")
+                    return
+
+                self.notify(f"Adding LoRa interface on {port}…", severity="information")
+                resp = self._send("add_lora_interface", {
+                    "port": port,
+                    "frequency": frequency,
+                    "spreading_factor": sf,
+                })
+                if resp.get("ok"):
+                    name = resp.get("name", port)
+                    freq_mhz = frequency / 1e6
+                    self.notify(
+                        f"LoRa added: {name} ({freq_mhz:.3f} MHz SF{sf})",
+                        severity="information",
+                    )
+                    self.call_from_thread(lambda: port_input.__setattr__("value", ""))
+                    self.call_from_thread(lambda: freq_input.__setattr__("value", ""))
+                    self.call_from_thread(lambda: sf_input.__setattr__("value", ""))
                     self.refresh_data()
                 else:
                     self.notify(f"Error: {resp.get('error', '?')}", severity="error")

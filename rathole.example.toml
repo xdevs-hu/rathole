@@ -618,9 +618,9 @@ duty_cycle_window = 3600
 # Typical values: -10 dB (conservative), -5 dB (moderate), 0 dB (strict)
 min_snr = -10.0
 
-# Optional minimum RSSI in dBm. Set to null to disable.
+# Optional minimum RSSI in dBm. Comment out to disable.
 # Example: min_rssi = -120.0
-min_rssi = null  # disabled
+# min_rssi = -120.0
 
 # Action when SNR/RSSI is too low: "drop" or "flag" (log only).
 snr_action = "drop"

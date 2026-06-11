@@ -8,9 +8,9 @@ WORKDIR /app
 COPY . .
 
 RUN pip install --no-cache-dir -e ".[all]" && \
-    useradd -r -s /bin/false rathole && \
-    mkdir -p /var/lib/rathole /var/run && \
-    chown rathole:rathole /var/lib/rathole /var/run
+    useradd -r -m -d /home/rathole -s /bin/false rathole && \
+    mkdir -p /var/lib/rathole /var/run /home/rathole/.reticulum && \
+    chown -R rathole:rathole /var/lib/rathole /var/run /home/rathole
 
 USER rathole
 
