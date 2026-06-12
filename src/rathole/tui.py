@@ -544,6 +544,9 @@ def _build_tui(sock_path: str, refresh_interval: float = 5.0,
                 yield Input(placeholder="Serial port (e.g. /dev/ttyUSB0)", id="lora-port-input")
                 yield Input(placeholder="Freq Hz (e.g. 868000000)", id="lora-freq-input")
                 yield Input(placeholder="SF 7-12 (default 8)", id="lora-sf-input")
+                yield Input(placeholder="BW Hz (e.g. 125000)", id="lora-bw-input")
+                yield Input(placeholder="TX Power dBm (2-17)", id="lora-txpower-input")
+                yield Input(placeholder="CR 5-8 (default 5)", id="lora-cr-input")
                 yield Button("Add LoRa", id="lora-add-btn", variant="warning")
             yield Static(id="i2p-b32-display")
             yield Button("Copy", id="i2p-b32-copy-btn", variant="default")
@@ -779,9 +782,39 @@ def _build_tui(sock_path: str, refresh_interval: float = 5.0,
         }
 
         /* ── Peer actions / event filters / blackhole form / interface form ── */
-        #peer-actions, #event-filters, #bh-add-form, #iface-add-form, #i2p-add-form, #lora-add-form, #registry-btn-form {
+        #peer-actions, #event-filters, #bh-add-form, #iface-add-form, #i2p-add-form, #registry-btn-form {
             height: 3;
             padding: 0 1;
+        }
+
+        #lora-add-form {
+            height: auto;
+            min-height: 3;
+            padding: 0 1;
+        }
+
+        #lora-port-input {
+            width: 2fr;
+        }
+
+        #lora-freq-input {
+            width: 2fr;
+        }
+
+        #lora-bw-input {
+            width: 1fr;
+        }
+
+        #lora-sf-input {
+            width: 10;
+        }
+
+        #lora-txpower-input {
+            width: 12;
+        }
+
+        #lora-cr-input {
+            width: 10;
         }
 
         #registry-section-header {
@@ -2256,6 +2289,9 @@ def _build_tui(sock_path: str, refresh_interval: float = 5.0,
                 port_input = self.query_one("#lora-port-input", Input)
                 freq_input = self.query_one("#lora-freq-input", Input)
                 sf_input = self.query_one("#lora-sf-input", Input)
+                bw_input = self.query_one("#lora-bw-input", Input)
+                txpower_input = self.query_one("#lora-txpower-input", Input)
+                cr_input = self.query_one("#lora-cr-input", Input)
 
                 port = port_input.value.strip()
                 if not port:
@@ -2276,22 +2312,56 @@ def _build_tui(sock_path: str, refresh_interval: float = 5.0,
                     self.notify("Spreading factor must be 7–12", severity="error")
                     return
 
+                try:
+                    bandwidth = int(bw_input.value.strip()) if bw_input.value.strip() else 125_000
+                    if bandwidth <= 0:
+                        raise ValueError
+                except ValueError:
+                    self.notify("Bandwidth must be a positive integer in Hz (e.g. 125000)", severity="error")
+                    return
+
+                try:
+                    txpower = int(txpower_input.value.strip()) if txpower_input.value.strip() else 17
+                    if not (2 <= txpower <= 17):
+                        raise ValueError
+                except ValueError:
+                    self.notify("TX Power must be 2–17 dBm", severity="error")
+                    return
+
+                try:
+                    cr = int(cr_input.value.strip()) if cr_input.value.strip() else 5
+                    if not (5 <= cr <= 8):
+                        raise ValueError
+                except ValueError:
+                    self.notify("Coding rate must be 5–8 (4/5 through 4/8)", severity="error")
+                    return
+
                 self.notify(f"Adding LoRa interface on {port}…", severity="information")
                 resp = self._send("add_lora_interface", {
                     "port": port,
                     "frequency": frequency,
                     "spreading_factor": sf,
+                    "bandwidth": bandwidth,
+                    "txpower": txpower,
+                    "coding_rate": cr,
                 })
                 if resp.get("ok"):
                     name = resp.get("name", port)
                     freq_mhz = frequency / 1e6
+                    bw_khz = bandwidth / 1000
                     self.notify(
-                        f"LoRa added: {name} ({freq_mhz:.3f} MHz SF{sf})",
+                        f"LoRa added: {name} ({freq_mhz:.3f} MHz SF{sf} BW{bw_khz:.0f}kHz {txpower}dBm CR4/{cr})",
                         severity="information",
                     )
-                    self.call_from_thread(lambda: port_input.__setattr__("value", ""))
-                    self.call_from_thread(lambda: freq_input.__setattr__("value", ""))
-                    self.call_from_thread(lambda: sf_input.__setattr__("value", ""))
+                    # Reload submitted values back into the input fields so the
+                    # user can see the active configuration and reuse/edit it.
+                    _port, _freq, _sf, _bw, _txp, _cr = port, str(frequency), str(sf), str(bandwidth), str(txpower), str(cr)
+                    self.call_from_thread(lambda: port_input.__setattr__("value", _port))
+                    self.call_from_thread(lambda: freq_input.__setattr__("value", _freq))
+                    self.call_from_thread(lambda: sf_input.__setattr__("value", _sf))
+                    self.call_from_thread(lambda: bw_input.__setattr__("value", _bw))
+                    self.call_from_thread(lambda: txpower_input.__setattr__("value", _txp))
+                    self.call_from_thread(lambda: cr_input.__setattr__("value", _cr))
                     self.refresh_data()
                 else:
                     self.notify(f"Error: {resp.get('error', '?')}", severity="error")
