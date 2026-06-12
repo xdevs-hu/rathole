@@ -654,14 +654,20 @@ def _build_tui(sock_path: str, refresh_interval: float = 5.0,
 
         def compose(self) -> ComposeResult:
             # Controls panel — presets, toggles, quick settings
-            from .presets import list_presets, DESCRIPTIONS
+            from .presets import list_presets, DESCRIPTIONS, PRESET_DISPLAY_NAMES
             all_presets = list_presets()
             options = [
-                (p["name"].capitalize(), p["name"])
+                (PRESET_DISPLAY_NAMES.get(p["name"], p["name"].capitalize()), p["name"])
                 for p in all_presets
             ]
             with Vertical(classes="panel", id="config-presets-panel"):
                 with Horizontal(id="config-presets"):
+                    yield Select(
+                        [("Client Mode", "client"), ("Gateway Mode", "gateway")],
+                        value="client",
+                        allow_blank=False,
+                        id="cfg-node-mode",
+                    )
                     yield Select(
                         options,
                         prompt="Select Preset", id="preset-select",
@@ -1046,6 +1052,7 @@ def _build_tui(sock_path: str, refresh_interval: float = 5.0,
             self._last_peers_refresh: float = 0.0
             self._peers_refresh_interval: float = 60.0  # Peers tab updates every 60s
             self._force_peers_refresh: bool = True  # Force on first load
+            self._last_node_mode: str = ""  # Track mode to avoid resetting preset selector
             # (prevent() context manager is used instead of a flag to suppress
             #  Switch.Changed / Select.Changed during programmatic updates)
 
@@ -1793,8 +1800,23 @@ def _build_tui(sock_path: str, refresh_interval: float = 5.0,
                 adaptive = config.get("adaptive", {})
                 correlator = config.get("correlator", {})
 
-                # Update interactive quick-setting widgets — suppress events
+                # Update interactive quick-setting widgets — suppress events.
+                # Mode selector: only sync on first render (_last_node_mode == "")
+                # or when daemon mode changes AND user has no pending selection.
+                # Never overwrite a pending user selection (would reset before Apply).
                 with self.prevent(Switch.Changed, Select.Changed):
+                    try:
+                        sel_nm = self.query_one("#cfg-node-mode", Select)
+                        nm_val = str(general.get("node_mode", "client"))
+                        from textual.widgets.select import NoSelection
+                        ui_val = sel_nm.value
+                        ui_str = nm_val if isinstance(ui_val, NoSelection) else str(ui_val)
+                        # Sync only on first render, or when UI already matches daemon
+                        # (no pending user change). Never overwrite a pending selection.
+                        if self._last_node_mode == "" or ui_str == nm_val:
+                            sel_nm.value = nm_val
+                    except Exception:
+                        pass
                     try:
                         sw_bh = self.query_one("#cfg-auto-blackhole", Switch)
                         bh_val = bool(rep.get("auto_blackhole", False))
@@ -1826,18 +1848,30 @@ def _build_tui(sock_path: str, refresh_interval: float = 5.0,
                 else:
                     mode_label = "[bold green]CLIENT[/]"
 
-                # Update preset selector to show mode-appropriate presets
+                # Update preset selector only when the daemon's mode changes.
+                # If the user has a pending mode selection in the UI (not yet Applied),
+                # don't overwrite their preset list with the daemon's current mode.
                 try:
-                    from .presets import list_presets as _lp
-                    mode_presets = _lp(node_mode)
-                    preset_options = [("Select Preset", "")] + [
-                        (p["name"].capitalize(), p["name"])
-                        for p in mode_presets
-                    ]
-                    sel = self.query_one("#preset-select", Select)
-                    sel.set_options(preset_options)
+                    from textual.widgets.select import NoSelection
+                    ui_mode_sel = self.query_one("#cfg-node-mode", Select)
+                    _v = ui_mode_sel.value
+                    ui_mode = node_mode if isinstance(_v, NoSelection) else str(_v)
                 except Exception:
-                    pass
+                    ui_mode = node_mode
+
+                if node_mode != self._last_node_mode and ui_mode == node_mode:
+                    self._last_node_mode = node_mode
+                    try:
+                        from .presets import list_presets as _lp, PRESET_DISPLAY_NAMES as _PDN
+                        mode_presets = _lp(node_mode)
+                        preset_options = [
+                            (_PDN.get(p["name"], p["name"].capitalize()), p["name"])
+                            for p in mode_presets
+                        ]
+                        sel = self.query_one("#preset-select", Select)
+                        sel.set_options(preset_options)
+                    except Exception:
+                        pass
 
                 # Summary panel
                 try:
@@ -2445,25 +2479,47 @@ def _build_tui(sock_path: str, refresh_interval: float = 5.0,
         @work(thread=True)
         def _handle_preset_apply(self) -> None:
             try:
-                select = self.query_one("#preset-select", Select)
-                name = select.value
+                from textual.widgets.select import NoSelection
+                mode_select = self.query_one("#cfg-node-mode", Select)
+                preset_select = self.query_one("#preset-select", Select)
+
+                # Select.value returns a NoSelection sentinel when nothing is chosen
+                raw_mode = mode_select.value
+                raw_name = preset_select.value
+                mode = None if isinstance(raw_mode, NoSelection) else str(raw_mode)
+                name = None if isinstance(raw_name, NoSelection) else str(raw_name)
+
                 if not name:
                     self.notify("Select a preset first", severity="warning")
                     return
+
+                # Apply preset first (it sets its own node_mode internally)
                 resp = self._send("presets", {"action": "apply", "name": name})
-                if resp.get("ok"):
-                    self.notify(f"✓ Applied preset: {name}", severity="information")
-                    self.refresh_data()
-                else:
+                if not resp.get("ok"):
                     self.notify(f"Error: {resp.get('error', '?')}", severity="error")
+                    return
+
+                # Override node_mode AFTER preset apply if user explicitly chose a mode.
+                # Only needed for the cross-mode 'lora' preset which has no built-in node_mode.
+                # For all other presets the mode selector is informational — the preset wins.
+                # We still honour an explicit mode selection to allow e.g. gateway+lora.
+                if mode:
+                    self._send("config", {"action": "set", "section": "general",
+                                          "key": "node_mode", "value": mode})
+
+                mode_str = f" (mode: {mode})" if mode else ""
+                self.notify(f"✓ Applied preset: {name}{mode_str}", severity="information")
+                self.refresh_data()
             except Exception as e:
                 self.notify(f"Error: {e}", severity="error")
 
         @work(thread=True)
         def _handle_preset_diff(self) -> None:
             try:
+                from textual.widgets.select import NoSelection
                 select = self.query_one("#preset-select", Select)
-                name = select.value
+                raw = select.value
+                name = None if isinstance(raw, NoSelection) else str(raw)
                 if not name:
                     self.notify("Select a preset first", severity="warning")
                     return
@@ -2591,10 +2647,29 @@ def _build_tui(sock_path: str, refresh_interval: float = 5.0,
         def on_select_changed(self, event: Select.Changed) -> None:
             if event.select.id in ("event-severity-filter", "event-type-filter"):
                 self.refresh_data()
-            elif event.select.id == "cfg-response-mode":
-                val = event.value
+            elif event.select.id == "cfg-node-mode":
+                # Update preset list immediately when mode changes (UI only — no daemon call).
+                # Also update _last_node_mode so the refresh loop doesn't reset the list again.
+                from textual.widgets.select import NoSelection
+                val = "" if isinstance(event.value, NoSelection) else str(event.value)
                 if val:
-                    self._handle_config_set("correlator", "response_mode", str(val))
+                    self._last_node_mode = val  # Prevent refresh loop from overwriting
+                    try:
+                        from .presets import list_presets as _lp, PRESET_DISPLAY_NAMES as _PDN
+                        mode_presets = _lp(val)
+                        preset_options = [
+                            (_PDN.get(p["name"], p["name"].capitalize()), p["name"])
+                            for p in mode_presets
+                        ]
+                        sel = self.query_one("#preset-select", Select)
+                        with self.prevent(Select.Changed):
+                            sel.set_options(preset_options)
+                    except Exception:
+                        pass
+            elif event.select.id == "cfg-response-mode":
+                from textual.widgets.select import NoSelection
+                if not isinstance(event.value, NoSelection):
+                    self._handle_config_set("correlator", "response_mode", str(event.value))
 
         def on_input_changed(self, event: Input.Changed) -> None:
             if event.input.id in ("event-search", "peer-filter"):

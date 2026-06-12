@@ -227,7 +227,31 @@ sudo systemctl enable --now rathole
 ### Docker
 
 ```bash
-cd deploy && docker compose up -d
+# 1. Create config from the example (first run only)
+cp rathole.example.toml deploy/rathole.toml
+
+# 2. Make the config writable by the container (uid=999 inside, your uid outside)
+chmod 666 deploy/rathole.toml
+
+# 3. Build and start
+cd deploy && docker compose up -d --build
+```
+
+The config file `deploy/rathole.toml` is a **bind mount** shared between host and container.
+TUI changes (preset apply, filter toggles, dry-run) are written back to this file automatically,
+so they survive container restarts and `docker compose down && up`.
+
+To apply a preset on first run, connect to the TUI:
+
+```bash
+docker exec -it rathole rathole --headless   # headless daemon is already running
+# or connect rathole-tui from the host if the control socket is exposed
+```
+
+To reset to defaults:
+
+```bash
+docker exec rathole rat reset -c /etc/rathole/rathole.toml
 ```
 
 ## Configuration

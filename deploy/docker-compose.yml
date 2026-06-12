@@ -20,11 +20,13 @@ services:
       - i2pd
     volumes:
       - rathole-state:/var/lib/rathole
-      - ./rathole.toml:/etc/rathole/rathole.toml:ro
+      - reticulum-data:/home/rathole/.reticulum   # Persist RNS identity & I2P keys
+      - ./rathole.toml:/etc/rathole/rathole.toml
     # network_mode: host exposes all ports directly on the host —
     # no ports: mapping needed. Prometheus metrics available at host:9777.
     network_mode: host  # Required for RNS transport access
 
 volumes:
   rathole-state:
+  reticulum-data:   # Stores RNS transport identity, routing tables, and I2P B32 keys
   i2pd-data:

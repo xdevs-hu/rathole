@@ -11,7 +11,7 @@ import logging
 import threading
 from pathlib import Path
 
-from .config import RatholeConfig, reload_config
+from .config import RatholeConfig, reload_config, save_config
 from .state import StateTracker
 from .router import PipelineRouter
 from .hook import install_hook, uninstall_hook
@@ -709,6 +709,8 @@ class RatholeDaemon:
                 data = conn.recv(4096).decode().strip()
                 response = self._handle_ctl_command(data)
                 conn.sendall(json.dumps(response).encode() + b"\n")
+            except BrokenPipeError:
+                pass  # Client closed before reading response — harmless
             except Exception as e:
                 log.error("Control socket error: %s", e)
             finally:
@@ -753,6 +755,8 @@ class RatholeDaemon:
                 data = conn.recv(4096).decode().strip()
                 response = self._handle_ctl_command(data)
                 conn.sendall(json.dumps(response).encode() + b"\n")
+            except BrokenPipeError:
+                pass  # Client closed before reading response — harmless
             except Exception as e:
                 log.error("Control socket error: %s", e)
             finally:
@@ -983,6 +987,7 @@ class RatholeDaemon:
                     from .config import _validate
                     _validate(self.config.raw)
                     self._propagate_config()
+                    save_config(self.config)
                     return {"ok": True}
                 return {"ok": False, "error": "section, key, and value required"}
             return {"ok": False, "error": f"Unknown config action: {subcmd}"}
@@ -991,10 +996,12 @@ class RatholeDaemon:
             if mode == "on":
                 self.config.raw["general"]["dry_run"] = True
                 self._propagate_config()
+                save_config(self.config)
                 return {"ok": True, "dry_run": True}
             elif mode == "off":
                 self.config.raw["general"]["dry_run"] = False
                 self._propagate_config()
+                save_config(self.config)
                 return {"ok": True, "dry_run": False}
             return {"ok": True, "dry_run": self.config.dry_run}
         elif cmd == "reload":
@@ -1019,6 +1026,7 @@ class RatholeDaemon:
                     return {"ok": False, "error": str(e)}
                 self.config.raw = merged
                 self._propagate_config()
+                save_config(self.config)
                 return {"ok": True}
             elif subcmd == "diff":
                 from .presets import preset_diff
@@ -1060,6 +1068,7 @@ class RatholeDaemon:
                 self._propagate_config()
                 from .config import _validate
                 _validate(self.config.raw)
+                save_config(self.config)
                 return {"ok": True}
             return {"ok": False, "error": f"Unknown filters action: {subcmd}"}
         elif cmd == "add_interface":
@@ -1484,6 +1493,7 @@ class RatholeDaemon:
         log.info("SIGHUP received — reloading config")
         self.config = reload_config(self.config)
         self._propagate_config()
+        # No save_config here — SIGHUP reloads FROM disk, not TO disk
 
     def _handle_registry_set_config(self, args: dict) -> dict:
         """Handle registry set_config RPC — toggle registry options at runtime."""
@@ -1522,4 +1532,5 @@ class RatholeDaemon:
                  reg_cfg.get("enabled"), reg_cfg.get("publish"),
                  reg_cfg.get("discover"), reg_cfg.get("auto_connect"))
 
+        save_config(self.config)
         return {"ok": True, "registry": self.registry.status()}

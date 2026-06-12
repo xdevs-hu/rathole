@@ -452,3 +452,93 @@ def reload_config(current: RatholeConfig) -> RatholeConfig:
     except Exception as e:
         log.error("Config reload failed: %s — keeping current config", e)
         return current
+
+
+def save_config(config: "RatholeConfig") -> bool:
+    """Persist the current in-memory config back to the TOML file on disk.
+
+    Only the keys that differ from DEFAULT_CONFIG are written, keeping the
+    file human-readable.  Keys that match the default are omitted so the
+    file stays minimal.  On the next ``reload_config`` call the saved file
+    is read and merged back over defaults, restoring the full config.
+
+    Returns True on success, False on failure (errors are logged).
+    """
+    if config.config_path is None:
+        log.warning("Cannot save config: no config_path set (started with defaults only)")
+        return False
+
+    # Build a minimal dict containing only values that differ from defaults.
+    # This keeps the saved file clean and avoids bloating it with every default.
+    def _diff_from_defaults(current: dict, defaults: dict) -> dict:
+        """Return only the keys in *current* that differ from *defaults*."""
+        out: dict = {}
+        for k, v in current.items():
+            dv = defaults.get(k)
+            if isinstance(v, dict) and isinstance(dv, dict):
+                sub = _diff_from_defaults(v, dv)
+                if sub:
+                    out[k] = sub
+            elif v != dv:
+                out[k] = v
+        return out
+
+    to_write = _diff_from_defaults(config.raw, DEFAULT_CONFIG)
+    toml_text = _simple_toml_dumps(to_write)
+
+    try:
+        config.config_path.write_text(toml_text, encoding="utf-8")
+        log.info("Config saved to %s", config.config_path)
+        return True
+    except OSError as e:
+        log.error("Failed to save config to %s: %s", config.config_path, e)
+        return False
+
+
+def _simple_toml_dumps(data: dict, _prefix: str = "") -> str:
+    """Minimal TOML serialiser for the subset of types used in rathole config.
+
+    Handles: bool, int, float, str, list (of str/int/float), nested dicts
+    (rendered as TOML tables).  Does NOT handle dates, inline tables, or
+    arrays of tables — none of which appear in rathole's config schema.
+    """
+    lines: list[str] = []
+    deferred: list[tuple[str, dict]] = []  # nested tables written after scalars
+
+    for k, v in data.items():
+        full_key = f"{_prefix}.{k}" if _prefix else k
+        if isinstance(v, dict):
+            deferred.append((full_key, v))
+        elif isinstance(v, bool):
+            lines.append(f"{k} = {'true' if v else 'false'}")
+        elif isinstance(v, int):
+            lines.append(f"{k} = {v}")
+        elif isinstance(v, float):
+            lines.append(f"{k} = {v}")
+        elif v is None:
+            # TOML has no null — skip None values
+            pass
+        elif isinstance(v, str):
+            escaped = v.replace("\\", "\\\\").replace('"', '\\"')
+            lines.append(f'{k} = "{escaped}"')
+        elif isinstance(v, list):
+            items = []
+            for item in v:
+                if isinstance(item, str):
+                    escaped = item.replace("\\", "\\\\").replace('"', '\\"')
+                    items.append(f'"{escaped}"')
+                elif isinstance(item, bool):
+                    items.append("true" if item else "false")
+                else:
+                    items.append(str(item))
+            lines.append(f"{k} = [{', '.join(items)}]")
+
+    result = "\n".join(lines)
+    if result:
+        result += "\n"
+
+    for full_key, sub in deferred:
+        result += f"\n[{full_key}]\n"
+        result += _simple_toml_dumps(sub, _prefix=full_key)
+
+    return result

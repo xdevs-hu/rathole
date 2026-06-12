@@ -5,9 +5,10 @@ Presets provide complete filter configurations tuned for different
 deployment profiles. They can be applied via CLI, TUI, or setup wizard.
 
 Gateway presets (public transport hub, hundreds of peers):
-  - observe:    Learn traffic patterns before blocking anything
-  - balanced:   Active defense with fair limits (recommended)
-  - fortress:   Zero tolerance, maximum protection
+  - observe:        Learn traffic patterns before blocking anything
+  - balanced:       Active defense with fair limits (recommended)
+  - fortress:       Zero tolerance, maximum protection
+  - gateway_lora:   Gateway with LoRa radio — balanced security + LoRa constraints
 
 Client presets (contributing transport node, local mesh):
   - relaxed:    Minimal interference, observe first
@@ -15,7 +16,7 @@ Client presets (contributing transport node, local mesh):
   - strict:     Tight security for cautious operators
 
 Cross-mode:
-  - lora:       Ultra-tight bandwidth caps for LoRa links
+  - lora:       Ultra-tight bandwidth caps for LoRa-only nodes
 """
 
 import copy
@@ -188,7 +189,72 @@ _STRICT: dict = {
 }
 
 
-# ── Cross-Mode: LoRa ────────────────────────────────────────────
+# ── Gateway + LoRa: public gateway bridging LoRa and TCP/I2P ────
+
+_GATEWAY_LORA: dict = {
+    "general": {
+        "node_mode": "gateway",
+        "dry_run": False,
+        # Does NOT override reticulum_config_path — keep user's setting
+    },
+    "filters": {
+        "allowdeny": {"enabled": True},
+        # LoRa topologies are deeper; TCP/I2P peers still benefit from a ceiling
+        "hop_ceiling": {"enabled": True, "max_hops": 32},
+        # Rate limits: tighter than pure gateway but looser than pure LoRa
+        # TCP/I2P peers can sustain higher rates; LoRa peers are naturally throttled
+        # by the radio itself — these limits protect the gateway from TCP flood
+        "rate_limit": {"enabled": True, "refill_rate": 0.5, "burst": 20},
+        "churn": {"enabled": True, "suppress_threshold": 10.0, "reuse_threshold": 2.0, "decay_interval": 120},
+        "anomaly": {"enabled": True, "anomaly_action": "drop", "max_announce_ratio": 30.0, "min_packets": 30},
+        # Interface rate: generous for TCP/I2P, LoRa is self-limiting
+        "interface_rate": {"enabled": True, "refill_rate": 20.0, "burst": 80},
+        # Bandwidth: LoRa is ~10 KB/s but TCP/I2P can do much more;
+        # set a moderate cap that won't starve TCP peers
+        "bandwidth": {"enabled": True, "bytes_per_second": 500_000, "burst_bytes": 1_000_000},
+        "packet_size": {"enabled": True, "max_bytes": 500},
+        "announce_size": {"enabled": True, "max_app_data_bytes": 300},
+        "path_request": {"enabled": True, "max_per_minute": 30, "scan_threshold": 15, "scan_window": 60},
+        "link_request": {"enabled": True, "refill_rate": 1.0, "burst": 10, "max_pending_per_interface": 30},
+        "resource_guard": {"enabled": True, "max_resource_bytes": 16_777_216, "max_active_per_interface": 10},
+        # LoRa-specific filters — no-ops on TCP/I2P interfaces
+        "lora_snr": {
+            "enabled": True,
+            "min_snr": -10.0,
+            "min_rssi": None,
+            "action": "drop",
+        },
+        "lora_airtime": {
+            "enabled": True,
+            "duty_cycle_percent": 1.0,   # EU 868 MHz legal limit
+            "window_seconds": 3600,
+            "spreading_factor": 8,
+            "bandwidth_hz": 125_000,
+        },
+    },
+    "reputation": {"enabled": True, "auto_blackhole": False},
+    "adaptive": {"enabled": True, "learning_hours": 12},
+    "correlator": {
+        "enabled": True,
+        "sybil_threshold": 20,
+        "response_mode": "defensive",
+        "grace_period": 300,
+    },
+    "metrics": {"enabled": True},
+    "eventstore": {"enabled": True},
+    "registry": {"enabled": True, "publish": True, "discover": True, "auto_connect": False},
+    "lora": {
+        "enabled": True,
+        "duty_cycle_percent": 1.0,
+        "duty_cycle_window": 3600,
+        "min_snr": -10.0,
+        "spreading_factor": 8,
+        "bandwidth_hz": 125_000,
+    },
+}
+
+
+# ── Cross-Mode: LoRa-only ────────────────────────────────────────
 
 _LORA: dict = {
     "general": {
@@ -245,6 +311,7 @@ PRESETS: dict[str, dict] = {
     "observe": _OBSERVE,
     "balanced": _BALANCED,
     "fortress": _FORTRESS,
+    "gateway_lora": _GATEWAY_LORA,
     # Client
     "relaxed": _RELAXED,
     "standard": _STANDARD,
@@ -255,7 +322,7 @@ PRESETS: dict[str, dict] = {
 
 # Presets available per mode (for setup wizard / TUI)
 MODE_PRESETS: dict[str, list[str]] = {
-    "gateway": ["observe", "balanced", "fortress", "lora"],
+    "gateway": ["observe", "balanced", "fortress", "gateway_lora", "lora"],
     "client": ["relaxed", "standard", "strict", "lora"],
 }
 
@@ -272,16 +339,33 @@ PRESET_ALIASES: dict[str, str] = {
     "client-relaxed": "relaxed",
     "client-balanced": "standard",
     "client-strict": "strict",
+    # Gateway+LoRa aliases
+    "gateway-lora": "gateway_lora",
+    "gateway_lora_bridge": "gateway_lora",
 }
 
 DESCRIPTIONS: dict[str, str] = {
     "observe": "Observe first — dry-run ON, generous limits, learn traffic for 24h, publishes to registry",
     "balanced": "Active defense — fair limits, adaptive learning, metrics enabled, publishes to registry",
     "fortress": "Zero tolerance — auto-blackhole, tight limits, defensive correlator, discovers but never publishes",
+    "gateway_lora": "Gateway + LoRa bridge — balanced security for TCP/I2P peers, SNR gate + duty-cycle for LoRa radio",
     "relaxed": "Minimal interference — dry-run ON, observe first, generous limits, auto-connects to gateways",
     "standard": "Good defaults — standard protection, adaptive learning enabled, auto-connects to gateways",
     "strict": "Tight security — strict rate limits, low hop ceiling, active monitoring, manual peering only",
-    "lora": "LoRa optimized — ultra-tight bandwidth, deeper hop ceiling, slow rates, registry disabled",
+    "lora": "LoRa only — ultra-tight bandwidth, SNR gate, duty-cycle enforcement, registry disabled",
+}
+
+# Human-readable display names for the TUI preset selector.
+# Use this instead of str.capitalize() to preserve acronym casing (e.g. LoRa).
+PRESET_DISPLAY_NAMES: dict[str, str] = {
+    "observe": "Observe",
+    "balanced": "Balanced",
+    "fortress": "Fortress",
+    "gateway_lora": "Gateway+LoRa",
+    "relaxed": "Relaxed",
+    "standard": "Standard",
+    "strict": "Strict",
+    "lora": "LoRa",
 }
 
 
