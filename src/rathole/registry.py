@@ -110,6 +110,10 @@ class RegistryClient:
         """Create the rathole.gateway RNS destination for announcing.
 
         Must be called after Reticulum transport is initialized.
+
+        If the destination was previously created and is still registered
+        in RNS Transport (e.g. after a publish toggle), it is reused
+        rather than re-created to avoid the 'already registered' error.
         """
         if not self.enabled or not self._publish:
             return
@@ -128,6 +132,24 @@ class RegistryClient:
 
         try:
             import RNS
+
+            # If a destination with the same hash is already registered in
+            # RNS Transport.destinations, reuse it instead of creating a new
+            # one — creating a duplicate raises 'already registered destination'.
+            dest_hash = RNS.Destination.hash(identity, "rathole", "gateway")
+            existing = None
+            try:
+                if hasattr(RNS.Transport, "destinations"):
+                    existing = RNS.Transport.destinations.get(dest_hash)
+            except Exception:
+                pass
+
+            if existing is not None:
+                self._gw_destination = existing
+                self._gw_destination.set_default_app_data(self._build_app_data)
+                log.info("Registry: reusing existing gateway destination: %s",
+                         RNS.prettyhexrep(self._gw_destination.hash))
+                return
 
             self._gw_destination = RNS.Destination(
                 identity,
@@ -188,9 +210,21 @@ class RegistryClient:
 
         There is no active deregistration — we simply stop announcing
         and the server-side entry expires naturally.
+
+        The RNS destination object is removed from Transport.destinations
+        so that a subsequent call to init_gateway_destination() can
+        re-create it without hitting 'already registered destination'.
         """
         if self._gw_destination is not None:
             log.info("Registry: stopped announcing (entry will expire after TTL)")
+            # Remove from RNS Transport so re-enabling publish works cleanly.
+            try:
+                import RNS
+                dest_hash = self._gw_destination.hash
+                if hasattr(RNS.Transport, "destinations"):
+                    RNS.Transport.destinations.pop(dest_hash, None)
+            except Exception as e:
+                log.debug("Registry: could not remove destination from Transport: %s", e)
         self._published = False
         self._gw_destination = None
         return True
