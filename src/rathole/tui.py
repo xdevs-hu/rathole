@@ -659,19 +659,23 @@ def _build_tui(sock_path: str, refresh_interval: float = 5.0,
     class ConfigTab(Vertical):
         """Interactive config with presets, quick toggles, and tuning."""
 
+        def __init__(self, initial_mode: str = "client"):
+            super().__init__()
+            self._initial_mode = initial_mode
+
         def compose(self) -> ComposeResult:
             # Controls panel — presets, toggles, quick settings
             from .presets import list_presets, DESCRIPTIONS, PRESET_DISPLAY_NAMES
-            all_presets = list_presets()
+            mode_presets = list_presets(self._initial_mode)
             options = [
                 (PRESET_DISPLAY_NAMES.get(p["name"], p["name"].capitalize()), p["name"])
-                for p in all_presets
+                for p in mode_presets
             ]
             with Vertical(classes="panel", id="config-presets-panel"):
                 with Horizontal(id="config-presets"):
                     yield Select(
                         [("Client Mode", "client"), ("Gateway Mode", "gateway")],
-                        value="client",
+                        value=self._initial_mode,
                         allow_blank=False,
                         id="cfg-node-mode",
                     )
@@ -1103,8 +1107,20 @@ def _build_tui(sock_path: str, refresh_interval: float = 5.0,
             self._peers_refresh_interval: float = 60.0  # Peers tab updates every 60s
             self._force_peers_refresh: bool = True  # Force on first load
             self._last_node_mode: str = ""  # Track mode to avoid resetting preset selector
-            # (prevent() context manager is used instead of a flag to suppress
-            #  Switch.Changed / Select.Changed during programmatic updates)
+            self._programmatic_mode_update: bool = False  # Flag to ignore self-triggered Select.Changed
+
+            # Fetch the initial node_mode synchronously so ConfigTab can be
+            # composed with the correct value before the first async refresh.
+            self._initial_node_mode: str = "client"
+            try:
+                _init_resp = self._send("config", {"action": "show"})
+                if _init_resp.get("ok"):
+                    _cfg = _init_resp.get("config", {})
+                    self._initial_node_mode = str(
+                        _cfg.get("general", {}).get("node_mode", "client")
+                    )
+            except Exception:
+                pass
 
         def _send(self, cmd: str, cmd_args: dict | None = None) -> dict:
             """Send command to the daemon.
@@ -1140,7 +1156,7 @@ def _build_tui(sock_path: str, refresh_interval: float = 5.0,
                     with TabPane("Filters", id="filters"):
                         yield FiltersTab()
                     with TabPane("Config", id="config"):
-                        yield ConfigTab()
+                        yield ConfigTab(initial_mode=self._initial_node_mode)
                     if self._log_handler is not None:
                         with TabPane("Console", id="console"):
                             yield ConsoleTab()
@@ -1920,23 +1936,26 @@ def _build_tui(sock_path: str, refresh_interval: float = 5.0,
                 adaptive = config.get("adaptive", {})
                 correlator = config.get("correlator", {})
 
-                # Update interactive quick-setting widgets — suppress events.
-                # Mode selector: only sync on first render (_last_node_mode == "")
-                # or when daemon mode changes AND user has no pending selection.
-                # Never overwrite a pending user selection (would reset before Apply).
+                node_mode = str(general.get("node_mode", "client"))
+
+                # Node-mode Select: updated OUTSIDE prevent() so Textual re-renders it.
+                # prevent() can suppress the reactive update driving the visual display.
+                # _programmatic_mode_update flag stops on_select_changed treating this
+                # as a user action.
+                try:
+                    sel_nm = self.query_one("#cfg-node-mode", Select)
+                    from textual.widgets.select import NoSelection
+                    ui_val = sel_nm.value
+                    ui_str = node_mode if isinstance(ui_val, NoSelection) else str(ui_val)
+                    # Sync when: first render, or UI already matches daemon (no pending user change).
+                    if self._last_node_mode == "" or ui_str == node_mode:
+                        self._programmatic_mode_update = True
+                        sel_nm.value = node_mode
+                        self._programmatic_mode_update = False
+                except Exception:
+                    self._programmatic_mode_update = False
+
                 with self.prevent(Switch.Changed, Select.Changed):
-                    try:
-                        sel_nm = self.query_one("#cfg-node-mode", Select)
-                        nm_val = str(general.get("node_mode", "client"))
-                        from textual.widgets.select import NoSelection
-                        ui_val = sel_nm.value
-                        ui_str = nm_val if isinstance(ui_val, NoSelection) else str(ui_val)
-                        # Sync only on first render, or when UI already matches daemon
-                        # (no pending user change). Never overwrite a pending selection.
-                        if self._last_node_mode == "" or ui_str == nm_val:
-                            sel_nm.value = nm_val
-                    except Exception:
-                        pass
                     try:
                         sw_bh = self.query_one("#cfg-auto-blackhole", Switch)
                         bh_val = bool(rep.get("auto_blackhole", False))
@@ -1962,15 +1981,13 @@ def _build_tui(sock_path: str, refresh_interval: float = 5.0,
                 dry_run = general.get("dry_run", False)
                 dr_str = "[yellow]ON[/]" if dry_run else "[green]OFF[/]"
                 resp_mode = correlator.get("response_mode", "alert")
-                node_mode = general.get("node_mode", "client")
                 if node_mode == "gateway":
                     mode_label = "[bold cyan]GATEWAY[/]"
                 else:
                     mode_label = "[bold green]CLIENT[/]"
 
-                # Update preset selector only when the daemon's mode changes.
-                # If the user has a pending mode selection in the UI (not yet Applied),
-                # don't overwrite their preset list with the daemon's current mode.
+                # Update preset selector when daemon mode changes (or on first render).
+                # Read the Select value to detect a pending user selection not yet Applied.
                 try:
                     from textual.widgets.select import NoSelection
                     ui_mode_sel = self.query_one("#cfg-node-mode", Select)
@@ -1989,7 +2006,8 @@ def _build_tui(sock_path: str, refresh_interval: float = 5.0,
                             for p in mode_presets
                         ]
                         sel = self.query_one("#preset-select", Select)
-                        sel.set_options(preset_options)
+                        with self.prevent(Select.Changed):
+                            sel.set_options(preset_options)
                     except Exception:
                         pass
 
@@ -2872,6 +2890,9 @@ def _build_tui(sock_path: str, refresh_interval: float = 5.0,
             if event.select.id in ("event-severity-filter", "event-type-filter"):
                 self.refresh_data()
             elif event.select.id == "cfg-node-mode":
+                # Ignore events triggered by _update_config's programmatic sync.
+                if self._programmatic_mode_update:
+                    return
                 # Update preset list immediately when mode changes (UI only — no daemon call).
                 # Also update _last_node_mode so the refresh loop doesn't reset the list again.
                 from textual.widgets.select import NoSelection
