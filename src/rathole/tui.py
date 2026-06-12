@@ -540,6 +540,7 @@ def _build_tui(sock_path: str, refresh_interval: float = 5.0,
                 yield Input(placeholder="I2P B32 address", id="i2p-b32-input")
                 yield Button("Connect I2P", id="i2p-connect-btn", variant="success")
                 yield Button("Start I2P Server", id="i2p-server-btn", variant="primary")
+            yield Vertical(id="i2p-peers-list")
             # LoRa: two mutually exclusive rows toggled by _update_lora_section()
             with Horizontal(id="lora-inputs-form"):
                 yield Input(placeholder="Serial port (e.g. /dev/ttyUSB0)", id="lora-port-input")
@@ -793,6 +794,28 @@ def _build_tui(sock_path: str, refresh_interval: float = 5.0,
         #peer-actions, #event-filters, #bh-add-form, #iface-add-form, #i2p-add-form, #registry-btn-form {
             height: 3;
             padding: 0 1;
+        }
+
+        #i2p-peers-list {
+            height: auto;
+            padding: 0 1;
+        }
+
+        .i2p-peer-row {
+            height: 3;
+            padding: 0 0;
+        }
+
+        .i2p-peer-label {
+            width: 1fr;
+            content-align-vertical: middle;
+            padding: 0 1;
+        }
+
+        .i2p-peer-remove-btn {
+            width: auto;
+            min-width: 16;
+            margin-left: 1;
         }
 
         #lora-inputs-form {
@@ -1328,6 +1351,10 @@ def _build_tui(sock_path: str, refresh_interval: float = 5.0,
                 stats.get("i2p_b32"),
                 stats.get("i2p_pending", False),
             )
+            self.call_from_thread(
+                self._update_i2p_peers_list,
+                stats.get("i2p_peers", []),
+            )
 
             # Registry status + gateway list
             reg_resp = self._send("registry", {"action": "status"})
@@ -1846,6 +1873,59 @@ def _build_tui(sock_path: str, refresh_interval: float = 5.0,
                 btn.display = bool(i2p_b32)
             except Exception:
                 pass
+
+        def _update_i2p_peers_list(self, peers: list):
+            """Render one row per I2P peer connection below the i2p-add-form.
+
+            Each row shows: ● Connecting/Connected  <full b32>  [Remove I2P]
+            The bullet is red while connecting (no live RNS interface yet) and
+            green once the interface is up.  The Remove button sends
+            remove_i2p_peer to the daemon and removes the config entry.
+            """
+            try:
+                container = self.query_one("#i2p-peers-list", Vertical)
+            except Exception:
+                return
+
+            # Collect names of currently live I2P peer interfaces from RNS
+            live_names: set[str] = set()
+            try:
+                import RNS
+                for iface in RNS.Transport.interfaces:
+                    type_name = type(iface).__name__
+                    if "I2P" in type_name and not getattr(iface, "connectable", False):
+                        live_names.add(getattr(iface, "name", ""))
+            except Exception:
+                pass
+
+            # Remove all existing peer rows and rebuild
+            container.remove_children()
+
+            for peer in peers:
+                name = peer.get("name", "")
+                b32 = peer.get("b32", "")
+                is_live = name in live_names
+
+                if is_live:
+                    bullet = "[bold green]●[/] [green]Connected[/]"
+                else:
+                    bullet = "[bold red]●[/] [red]Connecting[/]"
+
+                safe_id = name.replace(" ", "_").replace(".", "_")
+                row = Horizontal(classes="i2p-peer-row")
+                label = Static(
+                    f"{bullet}  {b32}",
+                    classes="i2p-peer-label",
+                )
+                btn = Button(
+                    "Remove I2P",
+                    id=f"i2p-peer-remove-{safe_id}",
+                    classes="i2p-peer-remove-btn",
+                    variant="warning",
+                )
+                container.mount(row)
+                row.mount(label)
+                row.mount(btn)
 
         def _update_registry(self, data: dict):
             try:
@@ -2366,6 +2446,9 @@ def _build_tui(sock_path: str, refresh_interval: float = 5.0,
                 self._handle_lora_remove()
             elif button_id == "i2p-b32-copy-btn":
                 self._handle_i2p_copy()
+            elif button_id.startswith("i2p-peer-remove-"):
+                safe_id = button_id[len("i2p-peer-remove-"):]
+                self._handle_i2p_peer_remove(safe_id)
             elif button_id == "registry-toggle-btn":
                 self._handle_registry_toggle()
             elif button_id == "registry-discover-btn":
@@ -2696,6 +2779,41 @@ def _build_tui(sock_path: str, refresh_interval: float = 5.0,
                     self.notify(f"B32: {b32}", severity="information")
             except Exception as e:
                 self.notify(f"Copy failed: {e}", severity="error")
+
+        @work(thread=True)
+        def _handle_i2p_peer_remove(self, safe_id: str) -> None:
+            """Remove an I2P peer interface by its safe_id (spaces/dots replaced with _).
+
+            Reconstructs the original interface name by scanning the daemon's
+            current i2p_peers list for a name whose safe form matches safe_id.
+            """
+            try:
+                # Fetch current peers from daemon to find the real name
+                status_resp = self._send("status")
+                peers = status_resp.get("stats", {}).get("i2p_peers", [])
+
+                # Match safe_id against each peer name
+                target_name = None
+                for peer in peers:
+                    name = peer.get("name", "")
+                    candidate_id = name.replace(" ", "_").replace(".", "_")
+                    if candidate_id == safe_id:
+                        target_name = name
+                        break
+
+                if not target_name:
+                    # Fallback: reconstruct from safe_id (best-effort)
+                    # "I2P_Peer_mrwqlsio" → "I2P Peer mrwqlsio"
+                    target_name = safe_id.replace("_", " ", 2)
+
+                resp = self._send("remove_i2p_peer", {"name": target_name})
+                if resp.get("ok"):
+                    self.notify(f"Removed I2P peer: {target_name}", severity="information")
+                    self.refresh_data()
+                else:
+                    self.notify(f"Error: {resp.get('error', '?')}", severity="error")
+            except Exception as e:
+                self.notify(f"Error: {e}", severity="error")
 
         @work(thread=True)
         def _handle_registry_discover(self) -> None:

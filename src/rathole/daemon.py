@@ -96,6 +96,7 @@ class RatholeDaemon:
         self._ready = threading.Event()   # Set once control socket is listening
         self._rns_instance = None
         self._i2p_interfaces: list = []
+        self._i2p_peers: list[dict] = []  # [{name, b32}] for peer (non-server) interfaces
         self._ctl_thread: threading.Thread | None = None
 
     def init(self, install_signals: bool = True):
@@ -864,6 +865,7 @@ class RatholeDaemon:
             from .i2p import get_i2p_b32_from_transport, has_i2p_interface
             stats["i2p_b32"] = get_i2p_b32_from_transport()
             stats["i2p_pending"] = has_i2p_interface() and not stats["i2p_b32"]
+            stats["i2p_peers"] = list(self._i2p_peers)
             from .lora import detect_lora_interfaces
             stats["lora_interfaces"] = detect_lora_interfaces()
             peers = self._enrich_peers(self.state.peer_summary())
@@ -1123,6 +1125,11 @@ class RatholeDaemon:
             if not validate_b32_address(b32):
                 return {"ok": False, "error": "Invalid B32 address (expected 52 base32 chars + .b32.i2p)"}
             return self._add_i2p_peer_interface(b32)
+        elif cmd == "remove_i2p_peer":
+            name = args.get("name", "").strip()
+            if not name:
+                return {"ok": False, "error": "name required (e.g. 'I2P Peer mrwqlsio')"}
+            return self._remove_i2p_peer_interface(name)
         elif cmd == "registry":
             action = args.get("action", "status")
             if action == "status":
@@ -1331,6 +1338,7 @@ class RatholeDaemon:
             interface = RNS_I2PInterface(RNS.Transport, config)
             self._rns_instance._add_interface(interface)
             self._i2p_interfaces.append(interface)
+            self._i2p_peers.append({"name": name, "b32": b32_address})
             log.info("Added I2P peer: %s", b32_address[:16])
 
             self._persist_i2p_interface(name, b32_address)
@@ -1338,6 +1346,77 @@ class RatholeDaemon:
         except Exception as e:
             log.error("Failed to add I2P peer %s: %s", b32_address[:16], e)
             return {"ok": False, "error": str(e)}
+
+    def _remove_i2p_peer_interface(self, name: str) -> dict:
+        """Detach a live I2P peer interface by name and remove it from the RNS config."""
+        try:
+            import RNS
+            target = None
+            for iface in list(RNS.Transport.interfaces):
+                if getattr(iface, "name", "") == name:
+                    target = iface
+                    break
+
+            if target is None:
+                # Not live — may still be in config; try to remove from config anyway
+                log.debug("I2P peer interface %s not found in live transport", name)
+            else:
+                try:
+                    if hasattr(target, "detach"):
+                        target.detach()
+                except Exception as e:
+                    log.warning("Error detaching I2P peer interface %s: %s", name, e)
+
+                try:
+                    RNS.Transport.interfaces.remove(target)
+                except (ValueError, AttributeError):
+                    pass
+
+                try:
+                    remaining = [
+                        i for i in RNS.Transport.interfaces
+                        if getattr(i, "name", "") != name
+                    ]
+                    if len(remaining) < len(RNS.Transport.interfaces):
+                        RNS.Transport.interfaces[:] = remaining
+                except Exception as e:
+                    log.debug("Could not filter transport interfaces: %s", e)
+
+                # Remove from our tracking list
+                self._i2p_interfaces = [
+                    i for i in self._i2p_interfaces
+                    if getattr(i, "name", "") != name
+                ]
+
+            # Remove from in-memory peers list
+            self._i2p_peers = [p for p in self._i2p_peers if p.get("name") != name]
+
+            # Remove from RNS config file
+            self._unpersist_i2p_interface(name)
+
+            log.info("Removed I2P peer interface: %s", name)
+            return {"ok": True, "name": name}
+        except Exception as e:
+            log.error("Failed to remove I2P peer interface %s: %s", name, e)
+            return {"ok": False, "error": str(e)}
+
+    def _unpersist_i2p_interface(self, name: str):
+        """Remove a named I2PInterface section from the RNS config file."""
+        try:
+            from .i2p import remove_rns_i2p_interface
+            rns_config_path = self.config.general.get("reticulum_config_path", "") or None
+            if rns_config_path:
+                config_file = Path(rns_config_path) / "config"
+            else:
+                config_file = _default_rns_dir() / "config"
+            if config_file.exists():
+                removed = remove_rns_i2p_interface(config_file, name)
+                if removed:
+                    log.info("Removed I2P interface %s from %s", name, config_file)
+                else:
+                    log.debug("I2P interface %s not found in %s (already removed?)", name, config_file)
+        except Exception as e:
+            log.warning("Failed to unpersist I2P interface %s: %s", name, e)
 
     def _persist_i2p_interface(self, name: str, b32_address: str):
         """Write the I2P peer to the RNS config file for persistence across restarts."""

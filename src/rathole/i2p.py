@@ -388,3 +388,90 @@ def add_rns_i2p_interface(
         else:
             text += "\n[interfaces]\n" + entry
         config_file.write_text(text)
+
+
+def remove_rns_i2p_interface(config_file: Path, name: str) -> bool:
+    """Remove a named I2PInterface section from an RNS config file.
+
+    Uses configobj if available, falls back to regex-based text removal.
+    Returns True if the section was found and removed.
+    """
+    try:
+        from configobj import ConfigObj
+        cfg = ConfigObj(str(config_file))
+        ifaces = cfg.get("interfaces", {})
+        if name in ifaces:
+            del ifaces[name]
+            cfg.write()
+            return True
+        return False
+    except ImportError:
+        pass
+
+    # Text fallback: remove the [[name]] block
+    try:
+        text = config_file.read_text()
+        # Match [[name]] section up to (but not including) the next [[...]] or end
+        pattern = re.compile(
+            r"\n[ \t]*\[\[" + re.escape(name) + r"\]\][ \t]*\n"
+            r"(?:(?!\[\[)[\s\S])*",
+            re.MULTILINE,
+        )
+        new_text, count = pattern.subn("", text)
+        if count:
+            config_file.write_text(new_text)
+            return True
+        return False
+    except OSError:
+        return False
+
+
+def list_rns_i2p_peers(config_file: Path) -> list[dict]:
+    """Return a list of I2P peer entries from the RNS config file.
+
+    Each entry is ``{"name": str, "b32": str}``.
+    Only non-connectable I2PInterface sections (peer connections) are returned.
+    """
+    result = []
+    if not config_file.exists():
+        return result
+
+    try:
+        from configobj import ConfigObj
+        cfg = ConfigObj(str(config_file))
+        for section_name, section in cfg.get("interfaces", {}).items():
+            if not isinstance(section, dict):
+                continue
+            if section.get("type", "").strip() != "I2PInterface":
+                continue
+            connectable = section.get("connectable", "no").strip().lower()
+            if connectable in ("yes", "true", "1"):
+                continue  # skip server interfaces
+            peers_val = section.get("peers", "").strip()
+            if peers_val:
+                result.append({"name": section_name, "b32": peers_val})
+        return result
+    except ImportError:
+        pass
+
+    # Text fallback
+    try:
+        text = config_file.read_text()
+        # Find all [[SectionName]] blocks
+        block_pattern = re.compile(
+            r"\[\[([^\]]+)\]\](.*?)(?=\[\[|\Z)", re.DOTALL
+        )
+        for m in block_pattern.finditer(text):
+            section_name = m.group(1).strip()
+            body = m.group(2)
+            if "I2PInterface" not in body:
+                continue
+            if re.search(r"connectable\s*=\s*(yes|true|1)", body, re.IGNORECASE):
+                continue
+            peers_m = re.search(r"peers\s*=\s*(.+)", body)
+            if peers_m:
+                result.append({"name": section_name, "b32": peers_m.group(1).strip()})
+    except OSError:
+        pass
+
+    return result
