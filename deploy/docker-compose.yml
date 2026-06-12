@@ -25,6 +25,34 @@ services:
     # network_mode: host exposes all ports directly on the host —
     # no ports: mapping needed. Prometheus metrics available at host:9777.
     network_mode: host  # Required for RNS transport access
+    # ── LoRa / RNode serial port access ──────────────────────────────
+    # Pass host serial devices into the container so rathole can open them
+    # for RNodeInterface (LoRa).  Add every port your hardware uses.
+    #
+    # Common device paths:
+    #   /dev/ttyUSB0   — CP210x / CH340 USB-serial adapters (most RNodes)
+    #   /dev/ttyACM0   — CDC-ACM devices (Arduino-based RNodes, some newer hardware)
+    #
+    # The container user (rathole, uid set in Dockerfile) must be in the
+    # host's 'dialout' group, OR the devices must be world-readable.
+    # On the host run:  sudo usermod -aG dialout <your-user>
+    # then re-login (or newgrp dialout) for the change to take effect.
+    #
+    # Uncomment and adjust the lines below to match your hardware:
+    #
+    # devices:
+    #   - /dev/ttyUSB0:/dev/ttyUSB0   # RNode on USB-serial adapter
+    #   - /dev/ttyACM0:/dev/ttyACM0   # RNode on CDC-ACM (e.g. T-Beam, Heltec)
+    #
+    # To expose ALL ttyUSB* and ttyACM* devices at once you can instead use
+    # privileged mode (less secure, but simpler for development):
+    #
+    # privileged: true
+    #
+    # Or grant only the 'dialout' group capability without full privilege:
+    #
+    # group_add:
+    #   - dialout
 
 volumes:
   rathole-state:

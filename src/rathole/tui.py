@@ -2387,6 +2387,17 @@ def _build_tui(sock_path: str, refresh_interval: float = 5.0,
                     self.notify("Serial port required (e.g. /dev/ttyUSB0)", severity="error")
                     return
 
+                # Fast client-side serial port check — gives a clear error before
+                # the daemon even tries to open the port via RNS.
+                try:
+                    from .lora import check_serial_port_available
+                    port_ok, port_err = check_serial_port_available(port)
+                    if not port_ok:
+                        self.notify(port_err, severity="error")
+                        return
+                except Exception:
+                    pass  # If the check itself fails, let the daemon handle it
+
                 try:
                     frequency = int(freq_input.value.strip()) if freq_input.value.strip() else 868_000_000
                 except ValueError:

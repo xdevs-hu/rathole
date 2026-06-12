@@ -73,6 +73,59 @@ def is_lora_context(ctx) -> bool:
 
 # ── Serial port detection ─────────────────────────────────────────
 
+def check_serial_port_available(port: str) -> tuple[bool, str]:
+    """Check whether a serial port path exists and can be opened.
+
+    Returns a ``(ok, error_message)`` tuple.  When *ok* is True the port
+    is present and not held by another process; *error_message* is empty.
+    When *ok* is False *error_message* contains a human-readable reason.
+
+    The check is intentionally lightweight — it only opens the port for
+    a fraction of a second to verify access, then closes it immediately.
+    It does NOT send any data to the device.
+
+    Typical failure reasons:
+      - Port path does not exist (device not plugged in, wrong path)
+      - Permission denied (user not in ``dialout`` / ``uucp`` group)
+      - Port already held by another process (e.g. rnsd already running)
+    """
+    import os
+
+    # 1. Path existence check (works without pyserial)
+    if not os.path.exists(port):
+        return False, f"Serial port not found: {port} — is the device plugged in?"
+
+    # 2. Try to open the port briefly to catch permission / busy errors
+    try:
+        import serial  # type: ignore
+        with serial.Serial(port, baudrate=115200, timeout=0.1):
+            pass
+        return True, ""
+    except ImportError:
+        # pyserial not installed — fall back to raw open() for a basic check
+        try:
+            fd = os.open(port, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
+            os.close(fd)
+            return True, ""
+        except PermissionError:
+            return False, (
+                f"Permission denied on {port} — "
+                "add your user to the 'dialout' group: sudo usermod -aG dialout $USER"
+            )
+        except OSError as exc:
+            return False, f"Cannot open {port}: {exc}"
+    except Exception as exc:
+        reason = str(exc)
+        if "permission" in reason.lower() or "access" in reason.lower():
+            return False, (
+                f"Permission denied on {port} — "
+                "add your user to the 'dialout' group: sudo usermod -aG dialout $USER"
+            )
+        if "busy" in reason.lower() or "resource" in reason.lower():
+            return False, f"{port} is busy — another process (e.g. rnsd) may already be using it"
+        return False, f"Cannot open {port}: {exc}"
+
+
 def detect_serial_ports() -> list[str]:
     """List candidate serial ports for RNode/LoRa hardware.
 

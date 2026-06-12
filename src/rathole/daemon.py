@@ -1374,6 +1374,14 @@ class RatholeDaemon:
                 if getattr(iface, "name", "") == name:
                     return {"ok": False, "error": f"LoRa interface on {port} already active"}
 
+            # Serial port availability check — fail fast with a clear message
+            # before handing the port to RNS (which gives cryptic errors on failure)
+            from .lora import check_serial_port_available
+            port_ok, port_err = check_serial_port_available(port)
+            if not port_ok:
+                log.error("LoRa serial port check failed: %s", port_err)
+                return {"ok": False, "error": port_err}
+
             config = {
                 "name": name,
                 "port": port,

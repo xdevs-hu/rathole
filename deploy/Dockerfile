@@ -21,9 +21,13 @@ WORKDIR /app
 COPY --from=builder /build/wheels /wheels
 
 # Install the matching architecture wheels cleanly
+# The rathole user is added to the 'dialout' group so it can open serial
+# ports (e.g. /dev/ttyUSB0, /dev/ttyACM0) for LoRa / RNode interfaces.
+# The host must also have the device mapped via docker-compose 'devices:'.
 RUN pip install --no-cache-dir /wheels/* && \
     rm -rf /wheels && \
     useradd -r -m -d /home/rathole -s /bin/false rathole && \
+    usermod -aG dialout rathole && \
     mkdir -p /var/lib/rathole /var/run /home/rathole/.reticulum /etc/rathole && \
     chown -R rathole:rathole /var/lib/rathole /var/run /home/rathole /etc/rathole
 
