@@ -1105,7 +1105,14 @@ class RatholeDaemon:
                 cr = int(args.get("coding_rate", 5))
             except (TypeError, ValueError) as e:
                 return {"ok": False, "error": f"Invalid radio parameter: {e}"}
+            if not (2 <= txpower <= 23):
+                return {"ok": False, "error": "txpower must be 2–23 dBm"}
             return self._add_lora_interface(port, frequency, bandwidth, txpower, sf, cr)
+        elif cmd == "remove_lora_interface":
+            name = args.get("name", "").strip()
+            if not name:
+                return {"ok": False, "error": "name required (e.g. 'LoRa /dev/ttyUSB0')"}
+            return self._remove_lora_interface(name)
         elif cmd == "add_i2p_server":
             return self._add_i2p_server_interface()
         elif cmd == "add_i2p_peer":
@@ -1401,6 +1408,74 @@ class RatholeDaemon:
         except Exception as e:
             log.error("Failed to add LoRa interface on %s: %s", port, e)
             return {"ok": False, "error": str(e)}
+
+    def _remove_lora_interface(self, name: str) -> dict:
+        """Detach a live LoRa interface by name and remove it from the RNS config."""
+        try:
+            import RNS
+            from .lora import is_lora_interface
+
+            # Find the interface object in the live transport list
+            target = None
+            for iface in list(RNS.Transport.interfaces):
+                if getattr(iface, "name", "") == name and is_lora_interface(iface):
+                    target = iface
+                    break
+
+            if target is None:
+                return {"ok": False, "error": f"LoRa interface '{name}' not found"}
+
+            # Detach from RNS transport
+            try:
+                if hasattr(target, "detach"):
+                    target.detach()
+            except Exception as e:
+                log.warning("Error detaching LoRa interface %s: %s", name, e)
+
+            # Remove from transport list — use name-based filter as fallback
+            # because RNS.Transport.interfaces may not support .remove() by identity
+            try:
+                RNS.Transport.interfaces.remove(target)
+            except (ValueError, AttributeError):
+                pass
+            # Belt-and-suspenders: also filter by name in case .remove() silently failed
+            try:
+                remaining = [
+                    i for i in RNS.Transport.interfaces
+                    if getattr(i, "name", "") != name
+                ]
+                if len(remaining) < len(RNS.Transport.interfaces):
+                    RNS.Transport.interfaces[:] = remaining
+            except Exception as e:
+                log.debug("Could not filter transport interfaces: %s", e)
+
+            log.info("Removed LoRa interface: %s", name)
+
+            # Remove from persisted RNS config
+            self._unpersist_lora_interface(name)
+
+            return {"ok": True, "name": name}
+        except Exception as e:
+            log.error("Failed to remove LoRa interface %s: %s", name, e)
+            return {"ok": False, "error": str(e)}
+
+    def _unpersist_lora_interface(self, name: str):
+        """Remove a named RNodeInterface section from the RNS config file."""
+        try:
+            from .lora import remove_rns_lora_interface
+            rns_config_path = self.config.general.get("reticulum_config_path", "") or None
+            if rns_config_path:
+                config_file = Path(rns_config_path) / "config"
+            else:
+                config_file = _default_rns_dir() / "config"
+            if config_file.exists():
+                removed = remove_rns_lora_interface(config_file, name)
+                if removed:
+                    log.info("Removed LoRa interface %s from %s", name, config_file)
+                else:
+                    log.debug("LoRa interface %s not found in %s (already removed?)", name, config_file)
+        except Exception as e:
+            log.warning("Failed to unpersist LoRa interface %s: %s", name, e)
 
     def _persist_lora_interface(
         self,

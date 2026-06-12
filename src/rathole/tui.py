@@ -540,14 +540,18 @@ def _build_tui(sock_path: str, refresh_interval: float = 5.0,
                 yield Input(placeholder="I2P B32 address", id="i2p-b32-input")
                 yield Button("Connect I2P", id="i2p-connect-btn", variant="success")
                 yield Button("Start I2P Server", id="i2p-server-btn", variant="primary")
-            with Horizontal(id="lora-add-form"):
+            # LoRa: two mutually exclusive rows toggled by _update_lora_section()
+            with Horizontal(id="lora-inputs-form"):
                 yield Input(placeholder="Serial port (e.g. /dev/ttyUSB0)", id="lora-port-input")
                 yield Input(placeholder="Freq Hz (e.g. 868000000)", id="lora-freq-input")
                 yield Input(placeholder="SF 7-12 (default 8)", id="lora-sf-input")
                 yield Input(placeholder="BW Hz (e.g. 125000)", id="lora-bw-input")
-                yield Input(placeholder="TX Power dBm (2-17)", id="lora-txpower-input")
+                yield Input(placeholder="TX Power dBm (2-23)", id="lora-txpower-input")
                 yield Input(placeholder="CR 5-8 (default 5)", id="lora-cr-input")
-                yield Button("Add LoRa", id="lora-add-btn", variant="warning")
+                yield Button("Add LoRa", id="lora-add-btn", variant="success")
+            with Horizontal(id="lora-active-info"):
+                yield Static("", id="lora-active-text")
+                yield Button("Remove LoRa", id="lora-remove-btn", variant="warning")
             yield Static(id="i2p-b32-display")
             yield Button("Copy", id="i2p-b32-copy-btn", variant="default")
             yield DataTable(id="interface-table")
@@ -787,9 +791,22 @@ def _build_tui(sock_path: str, refresh_interval: float = 5.0,
             padding: 0 1;
         }
 
-        #lora-add-form {
+        #lora-inputs-form {
             height: auto;
             min-height: 3;
+            padding: 0 1;
+        }
+
+        #lora-active-info {
+            height: auto;
+            min-height: 3;
+            padding: 0 1;
+            display: none;
+        }
+
+        #lora-active-text {
+            width: 1fr;
+            content-align-vertical: middle;
             padding: 0 1;
         }
 
@@ -849,11 +866,11 @@ def _build_tui(sock_path: str, refresh_interval: float = 5.0,
             padding: 0 1;
         }
 
-        #peer-actions Input, #event-filters Input, #bh-add-form Input, #iface-add-form Input, #i2p-add-form Input, #lora-add-form Input {
+        #peer-actions Input, #event-filters Input, #bh-add-form Input, #iface-add-form Input, #i2p-add-form Input, #lora-inputs-form Input {
             width: 1fr;
         }
 
-        #peer-actions Button, #bh-add-form Button, #iface-add-form Button, #i2p-add-form Button, #lora-add-form Button {
+        #peer-actions Button, #bh-add-form Button, #iface-add-form Button, #i2p-add-form Button, #lora-inputs-form Button, #lora-active-info Button {
             margin-left: 1;
         }
 
@@ -1164,6 +1181,10 @@ def _build_tui(sock_path: str, refresh_interval: float = 5.0,
                 self.call_from_thread(self._update_peers, peers)
 
             self.call_from_thread(self._update_interfaces, ifaces)
+            self.call_from_thread(
+                self._update_lora_section,
+                stats.get("lora_interfaces", []),
+            )
             self.call_from_thread(
                 self._update_i2p_display,
                 stats.get("i2p_b32"),
@@ -1598,6 +1619,72 @@ def _build_tui(sock_path: str, refresh_interval: float = 5.0,
                     )
             except Exception:
                 pass
+
+        def _update_lora_section(self, lora_ifaces: list):
+            """Toggle between the LoRa input form and the active-info view.
+
+            When a LoRa interface is active:
+              - Hide #lora-inputs-form, show #lora-active-info with config summary.
+            When no LoRa interface is active:
+              - Show #lora-inputs-form (pre-filled if last config is known), hide #lora-active-info.
+            """
+            try:
+                inputs_form = self.query_one("#lora-inputs-form")
+                active_info = self.query_one("#lora-active-info")
+                active_text = self.query_one("#lora-active-text", Static)
+            except Exception:
+                return
+
+            if lora_ifaces:
+                # Show active view
+                # detect_lora_interfaces() uses "name" key; handle both sources
+                iface = lora_ifaces[0]
+                name = iface.get("name") or iface.get("interface", "LoRa")
+                port = iface.get("port", "?")
+                freq = iface.get("frequency", "?")
+                sf = iface.get("sf", "?")
+                bw = iface.get("bandwidth", "?")
+                txp = iface.get("txpower", "?")
+                cr = iface.get("cr", "?")
+
+                # Format frequency / bandwidth nicely
+                try:
+                    freq_str = f"{int(freq) / 1e6:.3f} MHz"
+                except Exception:
+                    freq_str = str(freq)
+                try:
+                    bw_str = f"{int(bw) / 1000:.0f} kHz"
+                except Exception:
+                    bw_str = str(bw)
+
+                info = (
+                    f"[bold green]● LoRa active[/]  [dim]{name}[/]\n"
+                    f"  Port: [cyan]{port}[/]  "
+                    f"Freq: [cyan]{freq_str}[/]  "
+                    f"SF: [cyan]{sf}[/]  "
+                    f"BW: [cyan]{bw_str}[/]  "
+                    f"TX: [cyan]{txp} dBm[/]  "
+                    f"CR: [cyan]4/{cr}[/]"
+                )
+                active_text.update(info)
+                inputs_form.display = False
+                active_info.display = True
+
+                # Also keep input fields in sync (for pre-fill on remove)
+                try:
+                    with self.prevent():
+                        self.query_one("#lora-port-input", Input).value = str(port)
+                        self.query_one("#lora-freq-input", Input).value = str(freq) if freq != "?" else ""
+                        self.query_one("#lora-sf-input", Input).value = str(sf) if sf != "?" else ""
+                        self.query_one("#lora-bw-input", Input).value = str(bw) if bw != "?" else ""
+                        self.query_one("#lora-txpower-input", Input).value = str(txp) if txp != "?" else ""
+                        self.query_one("#lora-cr-input", Input).value = str(cr) if cr != "?" else ""
+                except Exception:
+                    pass
+            else:
+                # Show input form (fields already pre-filled from last known config)
+                inputs_form.display = True
+                active_info.display = False
 
         def _update_i2p_display(self, i2p_b32, i2p_pending=False):
             try:
@@ -2135,6 +2222,8 @@ def _build_tui(sock_path: str, refresh_interval: float = 5.0,
                 self._handle_i2p_server()
             elif button_id == "lora-add-btn":
                 self._handle_lora_add()
+            elif button_id == "lora-remove-btn":
+                self._handle_lora_remove()
             elif button_id == "i2p-b32-copy-btn":
                 self._handle_i2p_copy()
             elif button_id == "registry-toggle-btn":
@@ -2322,10 +2411,10 @@ def _build_tui(sock_path: str, refresh_interval: float = 5.0,
 
                 try:
                     txpower = int(txpower_input.value.strip()) if txpower_input.value.strip() else 17
-                    if not (2 <= txpower <= 17):
+                    if not (2 <= txpower <= 23):
                         raise ValueError
                 except ValueError:
-                    self.notify("TX Power must be 2–17 dBm", severity="error")
+                    self.notify("TX Power must be 2–23 dBm (values above your hardware's limit are clamped by the chip)", severity="warning")
                     return
 
                 try:
@@ -2353,15 +2442,69 @@ def _build_tui(sock_path: str, refresh_interval: float = 5.0,
                         f"LoRa added: {name} ({freq_mhz:.3f} MHz SF{sf} BW{bw_khz:.0f}kHz {txpower}dBm CR4/{cr})",
                         severity="information",
                     )
-                    # Reload submitted values back into the input fields so the
-                    # user can see the active configuration and reuse/edit it.
-                    _port, _freq, _sf, _bw, _txp, _cr = port, str(frequency), str(sf), str(bandwidth), str(txpower), str(cr)
-                    self.call_from_thread(lambda: port_input.__setattr__("value", _port))
-                    self.call_from_thread(lambda: freq_input.__setattr__("value", _freq))
-                    self.call_from_thread(lambda: sf_input.__setattr__("value", _sf))
-                    self.call_from_thread(lambda: bw_input.__setattr__("value", _bw))
-                    self.call_from_thread(lambda: txpower_input.__setattr__("value", _txp))
-                    self.call_from_thread(lambda: cr_input.__setattr__("value", _cr))
+                    self.notify(
+                        "⚠ Please ensure your LoRa settings (frequency, TX power, duty cycle) "
+                        "do not violate radio regulations in your region.",
+                        severity="warning",
+                    )
+                    # Switch to active view — _update_lora_section will be called
+                    # by the next refresh_data() cycle via _update_interfaces().
+                    # Trigger it immediately with the known config so the UI
+                    # switches without waiting for the next poll.
+                    _lora_iface = [{
+                        "interface": name,
+                        "port": port,
+                        "frequency": frequency,
+                        "sf": sf,
+                        "bandwidth": bandwidth,
+                        "txpower": txpower,
+                        "cr": cr,
+                    }]
+                    self.call_from_thread(self._update_lora_section, _lora_iface)
+                    self.refresh_data()
+                else:
+                    self.notify(f"Error: {resp.get('error', '?')}", severity="error")
+            except Exception as e:
+                self.notify(f"Error: {e}", severity="error")
+
+        @work(thread=True)
+        def _handle_lora_remove(self) -> None:
+            """Remove the LoRa interface whose serial port is in the port input field."""
+            try:
+                port_input = self.query_one("#lora-port-input", Input)
+                port = port_input.value.strip()
+                if not port:
+                    self.notify("Serial port required to identify the LoRa interface", severity="error")
+                    return
+
+                # Snapshot current field values BEFORE removal so we can pre-fill on success
+                _port = port
+                _freq = self.query_one("#lora-freq-input", Input).value
+                _sf   = self.query_one("#lora-sf-input", Input).value
+                _bw   = self.query_one("#lora-bw-input", Input).value
+                _txp  = self.query_one("#lora-txpower-input", Input).value
+                _cr   = self.query_one("#lora-cr-input", Input).value
+
+                # Interface name is always "LoRa <port>" (matches _add_lora_interface naming)
+                name = f"LoRa {port}"
+                self.notify(f"Removing LoRa interface {name}…", severity="information")
+                resp = self._send("remove_lora_interface", {"name": name})
+                if resp.get("ok"):
+                    self.notify(f"Removed: {name}", severity="information")
+                    # Switch back to input view with previous values pre-filled
+                    # so the user can immediately re-add or adjust settings.
+                    def _restore_inputs():
+                        try:
+                            self.query_one("#lora-port-input", Input).value = _port
+                            self.query_one("#lora-freq-input", Input).value = _freq
+                            self.query_one("#lora-sf-input", Input).value = _sf
+                            self.query_one("#lora-bw-input", Input).value = _bw
+                            self.query_one("#lora-txpower-input", Input).value = _txp
+                            self.query_one("#lora-cr-input", Input).value = _cr
+                            self._update_lora_section([])  # Switch to input view
+                        except Exception:
+                            pass
+                    self.call_from_thread(_restore_inputs)
                     self.refresh_data()
                 else:
                     self.notify(f"Error: {resp.get('error', '?')}", severity="error")

@@ -14,7 +14,7 @@ Typical LoRa parameters for RNode:
   - Spreading Factor: 7–12 (higher = longer range, slower)
   - Bandwidth: 125 kHz, 250 kHz, 500 kHz
   - Coding Rate: 4/5, 4/6, 4/7, 4/8
-  - TX Power: 2–17 dBm (RNode hardware limit)
+  - TX Power: 2–23 dBm (hardware-dependent; SX1276 max ~20 dBm, SX1262 max ~22 dBm — chip clamps values above its physical limit)
 """
 
 from __future__ import annotations
@@ -205,7 +205,7 @@ FREQUENCY_PRESETS: dict[str, int] = {
 DEFAULT_RNODE_PARAMS: dict[str, Any] = {
     "frequency": 868_000_000,   # Hz — EU 868 MHz
     "bandwidth": 125_000,       # Hz — 125 kHz
-    "txpower": 17,              # dBm — max for most RNodes
+    "txpower": 17,              # dBm — safe default; hardware supports 2–23 dBm (chip clamps to its physical max)
     "spreadingfactor": 8,       # SF8 — good balance of range/speed
     "codingrate": 5,            # 4/5 coding rate
 }
@@ -239,7 +239,7 @@ def add_rns_rnode_interface(
     """
     try:
         from configobj import ConfigObj
-        cfg = ConfigObj(str(config_file))
+        cfg = ConfigObj(str(config_file), list_values=False, indent_type='  ')
         if "interfaces" not in cfg:
             cfg["interfaces"] = {}
 
@@ -280,16 +280,39 @@ def add_rns_rnode_interface(
 def remove_rns_lora_interface(config_file: Path, name: str) -> bool:
     """Remove a named RNodeInterface from an RNS config file.
 
+    Matches by section name first; if not found, falls back to matching
+    by port value so interfaces added outside of rathole (e.g. manually
+    or by rnsd) are also removed correctly.
+
     Returns True if the interface was found and removed.
     """
+    # Extract port from name "LoRa /dev/ttyACM0" → "/dev/ttyACM0"
+    port_hint = name[len("LoRa "):].strip() if name.startswith("LoRa ") else ""
+
     try:
         from configobj import ConfigObj
-        cfg = ConfigObj(str(config_file))
+        cfg = ConfigObj(str(config_file), list_values=False, indent_type='  ')
         ifaces = cfg.get("interfaces", {})
+
+        # Try exact name match first
         if name in ifaces:
             del ifaces[name]
             cfg.write()
             return True
+
+        # Fallback: find any RNodeInterface section whose port matches
+        if port_hint:
+            for section_name, section_data in list(ifaces.items()):
+                if not isinstance(section_data, dict):
+                    continue
+                itype = str(section_data.get("type", "")).strip()
+                iport = str(section_data.get("port", "")).strip()
+                if itype in ("RNodeInterface", "RNodeMultiInterface") and iport == port_hint:
+                    del ifaces[section_name]
+                    cfg.write()
+                    log.info("Removed LoRa interface section %r (port match) from %s", section_name, config_file)
+                    return True
+
         return False
     except ImportError:
         try:
@@ -298,12 +321,19 @@ def remove_rns_lora_interface(config_file: Path, name: str) -> bool:
             result = []
             skip = False
             found = False
+            current_section = None
             for line in lines:
                 stripped = line.strip()
-                if stripped == f"[[{name}]]":
-                    skip = True
-                    found = True
-                    continue
+                # Track current subsection name
+                if stripped.startswith("[[") and stripped.endswith("]]"):
+                    current_section = stripped[2:-2]
+                    if current_section == name:
+                        skip = True
+                        found = True
+                        continue
+                    # Port-based fallback: peek ahead not feasible in single pass,
+                    # so just match by name in text fallback
+                    skip = False
                 if skip:
                     if stripped.startswith("[[") or (
                         stripped.startswith("[") and not stripped.startswith("[[")
