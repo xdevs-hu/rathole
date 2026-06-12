@@ -1063,6 +1063,128 @@ def _build_tui(sock_path: str, refresh_interval: float = 5.0,
             background: $boost;
             border-top: solid $primary-darken-2;
         }
+
+        /* ── Selection / highlight / selected-state contrast fixes ──
+           The gruvbox theme inverts the background on selection but Rich
+           markup colours are explicit foreground values — they stay the same
+           and become invisible.  Force $text on every interactive state. */
+
+        /* DataTable: cursor row (focused) */
+        DataTable > .datatable--cursor {
+            background: $primary;
+            color: $text;
+        }
+
+        /* DataTable: cursor row (table not focused / blurred) */
+        DataTable > .datatable--cursor-inactive {
+            background: $primary-darken-2;
+            color: $text;
+        }
+
+        DataTable > .datatable--hover {
+            background: $primary-darken-2;
+            color: $text;
+        }
+
+        /* Select widget current value display (the closed widget) */
+        Select > SelectCurrent {
+            color: $text;
+        }
+
+        Select:focus > SelectCurrent {
+            background: $primary-darken-2;
+            color: $text;
+        }
+
+        /* Select dropdown overlay — highlighted (keyboard focus) */
+        SelectOverlay > .option-list--option-highlighted {
+            background: $primary;
+            color: $text;
+        }
+
+        /* Select dropdown overlay — selected (the already-chosen value) */
+        SelectOverlay > .option-list--option-highlighted.option-list--option-selected {
+            background: $primary;
+            color: $text;
+        }
+
+        SelectOverlay > .option-list--option-selected {
+            background: $primary-darken-1;
+            color: $text;
+        }
+
+        SelectOverlay > .option-list--option-hover {
+            background: $primary-darken-2;
+            color: $text;
+        }
+
+        /* OptionList (used internally by Select and standalone) */
+        OptionList > .option-list--option-highlighted {
+            background: $primary;
+            color: $text;
+        }
+
+        OptionList > .option-list--option-selected {
+            background: $primary-darken-1;
+            color: $text;
+        }
+
+        OptionList > .option-list--option-highlighted.option-list--option-selected {
+            background: $primary;
+            color: $text;
+        }
+
+        OptionList > .option-list--option-hover {
+            background: $primary-darken-2;
+            color: $text;
+        }
+
+        /* Collapsible title — readable when focused or hovered */
+        Collapsible > CollapsibleTitle:focus {
+            background: $primary-darken-2;
+            color: $text;
+        }
+
+        Collapsible > CollapsibleTitle:hover {
+            background: $primary-darken-3;
+            color: $text;
+        }
+
+        /* Button hover/focus — keep label text readable */
+        Button:hover {
+            color: $text;
+        }
+
+        Button:focus {
+            color: $text;
+        }
+
+        Button.-active {
+            color: $text;
+        }
+
+        /* ── Tab bar: fix selected tab text visibility ── */
+        Tab {
+            color: $text-muted;
+        }
+
+        Tab:hover {
+            color: $text;
+        }
+
+        Tab.-active {
+            color: $text;
+            background: $primary-darken-2;
+        }
+
+        Tab.-active:focus {
+            color: $text;
+            background: $primary-darken-2;
+        }
+
+        Tab:focus {
+            color: $text;
+        }
         """
 
         BINDINGS = [
