@@ -804,22 +804,18 @@ def _build_tui(sock_path: str, refresh_interval: float = 5.0,
         .i2p-peer-row {
             height: 3;
             padding: 0 0;
-            align-vertical: middle;
-            margin-bottom: 1;
         }
 
         .i2p-peer-label {
             width: 1fr;
-            content-align: left middle;
+            content-align-vertical: middle;
             padding: 0 1;
-            height: 3;
         }
 
         .i2p-peer-remove-btn {
             width: auto;
             min-width: 16;
             margin-left: 1;
-            height: 3;
         }
 
         #lora-inputs-form {
@@ -1881,14 +1877,20 @@ def _build_tui(sock_path: str, refresh_interval: float = 5.0,
         def _update_i2p_peers_list(self, peers: list):
             """Render one row per I2P peer connection below the i2p-add-form.
 
-            Each row shows: ● Connecting/Connected  <full b32>  [Remove I2P]
-            The bullet is yellow while the tunnel is establishing and green
-            once the tunnel is up.  The daemon enriches each peer entry with
-            a ``connected`` boolean (set by scanning RNS.Transport.interfaces
-            server-side, where the full interface name is available).  The TUI
-            uses that flag directly instead of doing its own RNS scan, which
-            is unreliable in shared-instance mode where the client-side proxy
-            may not reflect the actual rnsd interface names.
+            Each row shows: ● <status>  <full b32>  [Remove I2P]
+
+            Three status states (daemon-supplied flags):
+              ● Connected  (green)  — iface.online=True (Status: Up)
+              ● Checking…  (yellow) — interface present but Status: Down,
+                                      tunnel was connected before (new=False)
+              ● Connecting… (yellow) — first-time add (new=True) or interface
+                                      not yet in Transport
+
+            The daemon enriches each peer entry with ``connected``, ``present``
+            and ``new`` flags by scanning RNS.Transport.interfaces server-side,
+            where the full interface name is available.  The TUI uses those
+            flags directly instead of doing its own RNS scan, which is
+            unreliable in shared-instance mode.
             """
             try:
                 container = self.query_one("#i2p-peers-list", Vertical)
@@ -1901,13 +1903,25 @@ def _build_tui(sock_path: str, refresh_interval: float = 5.0,
             for peer in peers:
                 name = peer.get("name", "")
                 b32 = peer.get("b32", "")
-                # Use the daemon-supplied connected flag (enriched in status command).
-                is_live = bool(peer.get("connected", False))
+                # Use daemon-supplied flags (enriched in status command):
+                #   connected=True              → Status: Up  → Connected
+                #   connected=False, new=True   → first-time add, tunnel not yet up
+                #                                 → Connecting…
+                #   connected=False, present,
+                #     new=False                 → interface exists but Status: Down
+                #                                 (post-restart check or re-establishing)
+                #                                 → Checking…
+                #   connected=False, !present   → not in transport at all → Connecting…
+                is_connected = bool(peer.get("connected", False))
+                is_present   = bool(peer.get("present", False))
+                is_new       = bool(peer.get("new", False))
 
-                if is_live:
-                    bullet = "[bold green]●[/] [green]Connected[/]"
+                if is_connected:
+                    bullet = "[bold green]●[/] [bold green]Connected[/]"
+                elif is_present and not is_new:
+                    bullet = "[bold yellow]●[/] [bold yellow]Checking…[/]"
                 else:
-                    bullet = "[bold yellow]●[/] [yellow]Connecting[/]"
+                    bullet = "[bold yellow]●[/] [bold yellow]Connecting…[/]"
 
                 safe_id = name.replace(" ", "_").replace(".", "_")
                 row = Horizontal(classes="i2p-peer-row")

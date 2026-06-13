@@ -128,6 +128,12 @@ class RatholeDaemon:
         # Initialize Reticulum (registers signals — needs main thread)
         self._init_reticulum()
 
+        # Populate _i2p_peers from interfaces already loaded by rnsd/RNS on startup.
+        # When rathole restarts (or connects to a running rnsd), I2P peer interfaces
+        # that were persisted in the RNS config are already live in Transport.interfaces
+        # but _i2p_peers starts empty.  Scan and backfill so the TUI shows them.
+        self._sync_i2p_peers_from_transport()
+
         # Install the Transport hook
         install_hook(self.router)
 
@@ -868,30 +874,49 @@ class RatholeDaemon:
             # Enrich i2p_peers with live tunnel status by scanning Transport.interfaces.
             # The interface name in RNS is "I2P Peer <b32[:8]> to <full_b32>" while
             # we store only the short form "I2P Peer <b32[:8]>".  Match by prefix.
-            # Only count an interface as "connected" when it is online (Status: Up
-            # in rnstatus).  Interfaces that are Down (e.g. just after detach() or
-            # still establishing) have online=False and must show as Connecting.
+            # Three states:
+            #   connected=True  — interface present and online=True  (Status: Up)
+            #   connected=False, present=True  — interface present but online=False
+            #                                    (Status: Down, tunnel establishing
+            #                                     or brief post-restart check window)
+            #   connected=False, present=False — interface not in transport at all
+            #                                    (genuinely connecting / not yet added)
             try:
                 import RNS as _RNS
-                _live: set[str] = set()
+                _live_online: set[str] = set()   # online=True
+                _live_down: set[str] = set()     # present but online=False
                 for _iface in _RNS.Transport.interfaces:
                     _iname = getattr(_iface, "name", "")
                     if "I2P" in type(_iface).__name__ and not getattr(_iface, "connectable", False):
-                        # Require online=True (Status: Up) — default True if
-                        # attribute absent so non-standard RNS builds still work.
                         if getattr(_iface, "online", True):
-                            _live.add(_iname)
+                            _live_online.add(_iname)
+                        else:
+                            _live_down.add(_iname)
             except Exception:
-                _live = set()
+                _live_online = set()
+                _live_down = set()
 
             _enriched_peers = []
             for _p in self._i2p_peers:
                 _pname = _p.get("name", "")
-                _connected = any(
+                _is_online = any(
                     _ln == _pname or _ln.startswith(_pname + " ")
-                    for _ln in _live
+                    for _ln in _live_online
                 )
-                _enriched_peers.append({**_p, "connected": _connected})
+                _is_down = any(
+                    _ln == _pname or _ln.startswith(_pname + " ")
+                    for _ln in _live_down
+                )
+                # Clear "new" flag once the peer becomes connected for the
+                # first time — after that, Down state shows "Checking…"
+                # rather than "Connecting" (tunnel was established before).
+                if _is_online and _p.get("new"):
+                    _p["new"] = False
+                _enriched_peers.append({
+                    **_p,
+                    "connected": _is_online,
+                    "present": _is_online or _is_down,
+                })
             stats["i2p_peers"] = _enriched_peers
             from .lora import detect_lora_interfaces
             stats["lora_interfaces"] = detect_lora_interfaces()
@@ -1334,6 +1359,43 @@ class RatholeDaemon:
         except Exception as e:
             log.warning("I2P server active but failed to persist: %s", e)
 
+    def _sync_i2p_peers_from_transport(self):
+        """Backfill _i2p_peers from the RNS config file at startup.
+
+        Called once after _init_reticulum().  Reads the persisted
+        [[I2PInterface]] sections (connectable=no) from the RNS config file
+        and populates _i2p_peers so the TUI shows them immediately on a
+        fresh start without requiring a manual add via the TUI.
+
+        The status (Checking/Connected) is determined at runtime by the
+        status command scanning RNS.Transport.interfaces every 5 seconds.
+        """
+        try:
+            from .i2p import list_rns_i2p_peers
+            rns_config_path = self.config.general.get("reticulum_config_path", "") or None
+            if rns_config_path:
+                config_file = Path(rns_config_path) / "config"
+            else:
+                config_file = _default_rns_dir() / "config"
+
+            existing_names = {p.get("name", "") for p in self._i2p_peers}
+            count = 0
+            for entry in list_rns_i2p_peers(config_file):
+                b32 = entry.get("b32", "").strip()
+                if not b32:
+                    continue
+                short_name = f"I2P Peer {b32[:8]}"
+                if short_name in existing_names:
+                    continue
+                self._i2p_peers.append({"name": short_name, "b32": b32})
+                existing_names.add(short_name)
+                count += 1
+                log.info("Loaded I2P peer from config at startup: %s (%s)", short_name, b32[:16])
+            if count:
+                log.info("Backfilled %d I2P peer(s) from RNS config", count)
+        except Exception as e:
+            log.warning("Could not load I2P peers from config at startup: %s", e)
+
     def _persist_tcp_interface(self, name: str, host: str, port: int):
         """Write the interface to the RNS config file for persistence across restarts."""
         try:
@@ -1400,7 +1462,10 @@ class RatholeDaemon:
             interface = RNS_I2PInterface(RNS.Transport, config)
             self._rns_instance._add_interface(interface)
             self._i2p_interfaces.append(interface)
-            self._i2p_peers.append({"name": name, "b32": b32_address})
+            # Mark as "new" so the TUI shows "Connecting…" (first-time tunnel
+            # establishment) rather than "Checking…" (status poll after reconnect).
+            # The flag is cleared once the peer becomes connected for the first time.
+            self._i2p_peers.append({"name": name, "b32": b32_address, "new": True})
             log.info("Added I2P peer: %s", b32_address[:16])
 
             self._persist_i2p_interface(name, b32_address)
