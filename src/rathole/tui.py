@@ -804,10 +804,12 @@ def _build_tui(sock_path: str, refresh_interval: float = 5.0,
         .i2p-peer-row {
             height: 3;
             padding: 0 0;
+            align: left middle;
         }
 
         .i2p-peer-label {
             width: 1fr;
+            height: 100%;
             content-align-vertical: middle;
             padding: 0 1;
         }
@@ -822,6 +824,7 @@ def _build_tui(sock_path: str, refresh_interval: float = 5.0,
             height: auto;
             min-height: 3;
             padding: 0 1;
+            margin-top: 1;
         }
 
         #lora-active-info {
@@ -829,6 +832,7 @@ def _build_tui(sock_path: str, refresh_interval: float = 5.0,
             min-height: 3;
             padding: 0 1;
             display: none;
+            margin-top: 1;
         }
 
         #lora-active-text {
@@ -1899,6 +1903,9 @@ def _build_tui(sock_path: str, refresh_interval: float = 5.0,
 
             # Remove all existing peer rows and rebuild
             container.remove_children()
+            # Hide when empty so it contributes zero height; the margin-top on
+            # the LoRa forms provides the consistent 1-cell gap instead.
+            container.display = bool(peers)
 
             for peer in peers:
                 name = peer.get("name", "")
