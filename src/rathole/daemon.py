@@ -865,7 +865,34 @@ class RatholeDaemon:
             from .i2p import get_i2p_b32_from_transport, has_i2p_interface
             stats["i2p_b32"] = get_i2p_b32_from_transport()
             stats["i2p_pending"] = has_i2p_interface() and not stats["i2p_b32"]
-            stats["i2p_peers"] = list(self._i2p_peers)
+            # Enrich i2p_peers with live tunnel status by scanning Transport.interfaces.
+            # The interface name in RNS is "I2P Peer <b32[:8]> to <full_b32>" while
+            # we store only the short form "I2P Peer <b32[:8]>".  Match by prefix.
+            # Only count an interface as "connected" when it is online (Status: Up
+            # in rnstatus).  Interfaces that are Down (e.g. just after detach() or
+            # still establishing) have online=False and must show as Connecting.
+            try:
+                import RNS as _RNS
+                _live: set[str] = set()
+                for _iface in _RNS.Transport.interfaces:
+                    _iname = getattr(_iface, "name", "")
+                    if "I2P" in type(_iface).__name__ and not getattr(_iface, "connectable", False):
+                        # Require online=True (Status: Up) — default True if
+                        # attribute absent so non-standard RNS builds still work.
+                        if getattr(_iface, "online", True):
+                            _live.add(_iname)
+            except Exception:
+                _live = set()
+
+            _enriched_peers = []
+            for _p in self._i2p_peers:
+                _pname = _p.get("name", "")
+                _connected = any(
+                    _ln == _pname or _ln.startswith(_pname + " ")
+                    for _ln in _live
+                )
+                _enriched_peers.append({**_p, "connected": _connected})
+            stats["i2p_peers"] = _enriched_peers
             from .lora import detect_lora_interfaces
             stats["lora_interfaces"] = detect_lora_interfaces()
             peers = self._enrich_peers(self.state.peer_summary())
@@ -1335,15 +1362,33 @@ class RatholeDaemon:
             # ("I2P Peer mrwqlsio to mrwqlsio….b32.i2p") when running as a
             # shared-instance client where rnsd owns the interface.
             # Also check by B32 address to catch any naming variation.
+            #
+            # After a remove(), the interface may still linger in
+            # RNS.Transport.interfaces with Status: Down (detach() marks it
+            # down but rnsd keeps the object).  We allow re-add in that case
+            # by checking our own _i2p_peers tracking list: if the name is
+            # NOT in our tracking, the interface was already removed by us
+            # and is just a stale Down object — skip it.
+            tracked_names = {p.get("name", "") for p in self._i2p_peers}
             for iface in RNS.Transport.interfaces:
                 iface_name = getattr(iface, "name", "")
                 iface_peers = getattr(iface, "peers", None) or ""
                 # Match short name, long name (prefix), or B32 address
-                if (
+                name_match = (
                     iface_name == name
                     or iface_name.startswith(name + " ")
                     or b32_address in str(iface_peers)
-                ):
+                )
+                if name_match:
+                    # If this interface is not in our tracking list, it was
+                    # previously removed (detached/Down) — allow re-add.
+                    if name not in tracked_names:
+                        log.info(
+                            "I2P peer %s found in transport but not in tracking "
+                            "(previously removed, likely Down) — allowing re-add",
+                            b32_address[:16],
+                        )
+                        continue
                     return {"ok": False, "error": f"Already connected to {b32_address[:16]}..."}
 
             config = {
@@ -1367,16 +1412,14 @@ class RatholeDaemon:
     def _remove_i2p_peer_interface(self, name: str) -> dict:
         """Detach a live I2P peer interface by name and remove it from the RNS config.
 
-        When rathole runs as a shared-instance client of rnsd, the interface is
-        owned by rnsd.  RNS has no remove_interface RPC in the shared-instance
-        protocol, so we can only:
-          1. Attempt a best-effort detach/remove on the local Transport proxy.
-          2. Clear our in-memory tracking (_i2p_peers, _i2p_interfaces).
-          3. Remove the section from the RNS config file.
+        Calls detach() on the interface object, which causes rnsd to mark it
+        Down immediately — no traffic will flow after this point.  The underlying
+        SAM session in i2pd may linger until rnsd restarts, but rnsd will not
+        route packets through a Down interface.
 
-        The tunnel will remain active in rnsd until rnsd is restarted.
-        After restart the interface will not reappear because the config entry
-        has been removed.
+        Also clears in-memory tracking (_i2p_peers, _i2p_interfaces) and removes
+        the section from the RNS config file so the interface does not reappear
+        after rnsd restarts.
         """
         try:
             import RNS
@@ -1432,15 +1475,14 @@ class RatholeDaemon:
 
             if is_shared_client:
                 log.info(
-                    "I2P peer %s removed from config and tracking. "
-                    "Running as shared-instance client — rnsd owns the tunnel and "
-                    "will keep it active until restarted.",
+                    "I2P peer %s detached (interface marked Down by rnsd) and removed from config. "
+                    "SAM session may linger in i2pd until rnsd restarts, but no traffic will flow.",
                     name,
                 )
             else:
                 log.info("Removed I2P peer interface: %s", name)
 
-            return {"ok": True, "name": name, "requires_rnsd_restart": is_shared_client}
+            return {"ok": True, "name": name}
         except Exception as e:
             log.error("Failed to remove I2P peer interface %s: %s", name, e)
             return {"ok": False, "error": str(e)}

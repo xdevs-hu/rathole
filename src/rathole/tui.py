@@ -804,18 +804,22 @@ def _build_tui(sock_path: str, refresh_interval: float = 5.0,
         .i2p-peer-row {
             height: 3;
             padding: 0 0;
+            align-vertical: middle;
+            margin-bottom: 1;
         }
 
         .i2p-peer-label {
             width: 1fr;
-            content-align-vertical: middle;
+            content-align: left middle;
             padding: 0 1;
+            height: 3;
         }
 
         .i2p-peer-remove-btn {
             width: auto;
             min-width: 16;
             margin-left: 1;
+            height: 3;
         }
 
         #lora-inputs-form {
@@ -1878,28 +1882,18 @@ def _build_tui(sock_path: str, refresh_interval: float = 5.0,
             """Render one row per I2P peer connection below the i2p-add-form.
 
             Each row shows: ● Connecting/Connected  <full b32>  [Remove I2P]
-            The bullet is red while connecting (no live RNS interface yet) and
-            green once the interface is up.  The Remove button sends
-            remove_i2p_peer to the daemon and removes the config entry.
+            The bullet is yellow while the tunnel is establishing and green
+            once the tunnel is up.  The daemon enriches each peer entry with
+            a ``connected`` boolean (set by scanning RNS.Transport.interfaces
+            server-side, where the full interface name is available).  The TUI
+            uses that flag directly instead of doing its own RNS scan, which
+            is unreliable in shared-instance mode where the client-side proxy
+            may not reflect the actual rnsd interface names.
             """
             try:
                 container = self.query_one("#i2p-peers-list", Vertical)
             except Exception:
                 return
-
-            # Collect names of currently live I2P peer interfaces from RNS.
-            # RNS names the interface "I2P Peer <b32[:8]> to <full_b32>" while
-            # the daemon stores only the short form "I2P Peer <b32[:8]>".
-            # Match by prefix so "Connected" is shown once the tunnel is up.
-            live_names: set[str] = set()
-            try:
-                import RNS
-                for iface in RNS.Transport.interfaces:
-                    type_name = type(iface).__name__
-                    if "I2P" in type_name and not getattr(iface, "connectable", False):
-                        live_names.add(getattr(iface, "name", ""))
-            except Exception:
-                pass
 
             # Remove all existing peer rows and rebuild
             container.remove_children()
@@ -1907,17 +1901,13 @@ def _build_tui(sock_path: str, refresh_interval: float = 5.0,
             for peer in peers:
                 name = peer.get("name", "")
                 b32 = peer.get("b32", "")
-                # RNS appends " to <full_b32>" to the interface name, so check
-                # whether any live interface name starts with our short name.
-                is_live = any(
-                    live_name == name or live_name.startswith(name + " ")
-                    for live_name in live_names
-                )
+                # Use the daemon-supplied connected flag (enriched in status command).
+                is_live = bool(peer.get("connected", False))
 
                 if is_live:
                     bullet = "[bold green]●[/] [green]Connected[/]"
                 else:
-                    bullet = "[bold red]●[/] [red]Connecting[/]"
+                    bullet = "[bold yellow]●[/] [yellow]Connecting[/]"
 
                 safe_id = name.replace(" ", "_").replace(".", "_")
                 row = Horizontal(classes="i2p-peer-row")
@@ -2824,8 +2814,7 @@ def _build_tui(sock_path: str, refresh_interval: float = 5.0,
                 resp = self._send("remove_i2p_peer", {"name": target_name})
                 if resp.get("ok"):
                     self.notify(
-                        f"Removed I2P peer: {target_name} — config updated. "
-                        "Restart rnsd to fully detach the tunnel.",
+                        f"Removed I2P peer: {target_name} — interface brought down, config cleared.",
                         severity="information",
                     )
                     self.refresh_data()
