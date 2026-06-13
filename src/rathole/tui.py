@@ -1887,7 +1887,10 @@ def _build_tui(sock_path: str, refresh_interval: float = 5.0,
             except Exception:
                 return
 
-            # Collect names of currently live I2P peer interfaces from RNS
+            # Collect names of currently live I2P peer interfaces from RNS.
+            # RNS names the interface "I2P Peer <b32[:8]> to <full_b32>" while
+            # the daemon stores only the short form "I2P Peer <b32[:8]>".
+            # Match by prefix so "Connected" is shown once the tunnel is up.
             live_names: set[str] = set()
             try:
                 import RNS
@@ -1904,7 +1907,12 @@ def _build_tui(sock_path: str, refresh_interval: float = 5.0,
             for peer in peers:
                 name = peer.get("name", "")
                 b32 = peer.get("b32", "")
-                is_live = name in live_names
+                # RNS appends " to <full_b32>" to the interface name, so check
+                # whether any live interface name starts with our short name.
+                is_live = any(
+                    live_name == name or live_name.startswith(name + " ")
+                    for live_name in live_names
+                )
 
                 if is_live:
                     bullet = "[bold green]●[/] [green]Connected[/]"
@@ -2786,6 +2794,13 @@ def _build_tui(sock_path: str, refresh_interval: float = 5.0,
 
             Reconstructs the original interface name by scanning the daemon's
             current i2p_peers list for a name whose safe form matches safe_id.
+
+            NOTE: When rathole runs as a shared-instance client of rnsd, the
+            interface is owned by rnsd and cannot be removed from a running
+            rnsd process — RNS has no remove_interface RPC in the shared-instance
+            protocol.  The remove clears rathole's tracking and the RNS config
+            file so the interface will not reappear after rnsd restarts, but
+            rnsd will keep the tunnel active until it is restarted.
             """
             try:
                 # Fetch current peers from daemon to find the real name
@@ -2808,7 +2823,11 @@ def _build_tui(sock_path: str, refresh_interval: float = 5.0,
 
                 resp = self._send("remove_i2p_peer", {"name": target_name})
                 if resp.get("ok"):
-                    self.notify(f"Removed I2P peer: {target_name}", severity="information")
+                    self.notify(
+                        f"Removed I2P peer: {target_name} — config updated. "
+                        "Restart rnsd to fully detach the tunnel.",
+                        severity="information",
+                    )
                     self.refresh_data()
                 else:
                     self.notify(f"Error: {resp.get('error', '?')}", severity="error")

@@ -1253,12 +1253,17 @@ class RatholeDaemon:
             import RNS
             from RNS.Interfaces.I2PInterface import I2PInterface as RNS_I2PInterface
 
-            # Check if already have a connectable I2P interface
+            # Check if already have a connectable I2P interface.
+            # In shared-instance mode the interface name in RNS may differ from
+            # what we assigned, so check by type + connectable flag only.
             for iface in RNS.Transport.interfaces:
                 if "I2P" in type(iface).__name__ and getattr(iface, "connectable", False):
                     b32 = getattr(iface, "b32", None)
-                    return {"ok": False, "error": f"I2P server already running"
-                            + (f" ({b32[:16]}...)" if b32 else "")}
+                    return {
+                        "ok": False,
+                        "error": "I2P server already running"
+                        + (f" ({b32[:16]}...)" if b32 else ""),
+                    }
 
             from .i2p import probe_sam_api
             if not probe_sam_api():
@@ -1324,9 +1329,21 @@ class RatholeDaemon:
             from RNS.Interfaces.I2PInterface import I2PInterface as RNS_I2PInterface
 
             name = f"I2P Peer {b32_address[:8]}"
-            # Duplicate check
+
+            # Duplicate check — must handle both the short name we assign
+            # ("I2P Peer mrwqlsio") and the long name RNS uses internally
+            # ("I2P Peer mrwqlsio to mrwqlsio….b32.i2p") when running as a
+            # shared-instance client where rnsd owns the interface.
+            # Also check by B32 address to catch any naming variation.
             for iface in RNS.Transport.interfaces:
-                if getattr(iface, "name", "") == name:
+                iface_name = getattr(iface, "name", "")
+                iface_peers = getattr(iface, "peers", None) or ""
+                # Match short name, long name (prefix), or B32 address
+                if (
+                    iface_name == name
+                    or iface_name.startswith(name + " ")
+                    or b32_address in str(iface_peers)
+                ):
                     return {"ok": False, "error": f"Already connected to {b32_address[:16]}..."}
 
             config = {
@@ -1348,9 +1365,28 @@ class RatholeDaemon:
             return {"ok": False, "error": str(e)}
 
     def _remove_i2p_peer_interface(self, name: str) -> dict:
-        """Detach a live I2P peer interface by name and remove it from the RNS config."""
+        """Detach a live I2P peer interface by name and remove it from the RNS config.
+
+        When rathole runs as a shared-instance client of rnsd, the interface is
+        owned by rnsd.  RNS has no remove_interface RPC in the shared-instance
+        protocol, so we can only:
+          1. Attempt a best-effort detach/remove on the local Transport proxy.
+          2. Clear our in-memory tracking (_i2p_peers, _i2p_interfaces).
+          3. Remove the section from the RNS config file.
+
+        The tunnel will remain active in rnsd until rnsd is restarted.
+        After restart the interface will not reappear because the config entry
+        has been removed.
+        """
         try:
             import RNS
+
+            # Detect shared-instance mode — if so, the local Transport.interfaces
+            # list is a client-side proxy; removing from it does not affect rnsd.
+            is_shared_client = getattr(
+                self._rns_instance, "is_connected_to_shared_instance", False
+            )
+
             target = None
             for iface in list(RNS.Transport.interfaces):
                 if getattr(iface, "name", "") == name:
@@ -1394,8 +1430,17 @@ class RatholeDaemon:
             # Remove from RNS config file
             self._unpersist_i2p_interface(name)
 
-            log.info("Removed I2P peer interface: %s", name)
-            return {"ok": True, "name": name}
+            if is_shared_client:
+                log.info(
+                    "I2P peer %s removed from config and tracking. "
+                    "Running as shared-instance client — rnsd owns the tunnel and "
+                    "will keep it active until restarted.",
+                    name,
+                )
+            else:
+                log.info("Removed I2P peer interface: %s", name)
+
+            return {"ok": True, "name": name, "requires_rnsd_restart": is_shared_client}
         except Exception as e:
             log.error("Failed to remove I2P peer interface %s: %s", name, e)
             return {"ok": False, "error": str(e)}
