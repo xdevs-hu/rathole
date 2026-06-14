@@ -1184,35 +1184,8 @@ def cmd_setup(args):
     ))
     console.print()
 
-    # ─── Step 1: Node Mode ───────────────────────────────────────
-    console.print("[bold]── Step 1: Node Mode ──[/]\n")
-
-    console.print(Panel(
-        "  [bold]1. Gateway[/] — Public transport hub\n"
-        "     You're hosting a transport node on a server/VPS\n"
-        "     that others connect TO. You have a public IP or\n"
-        "     port-forwarded address. Hundreds of peers may\n"
-        "     connect. Strong defenses and monitoring enabled.\n"
-        "\n"
-        "  [bold]2. Client[/]  — Contributing transport node\n"
-        "     You're joining existing networks to help relay\n"
-        "     traffic. You connect TO gateways and local peers.\n"
-        "     Lower traffic volume, simpler security needs.",
-        border_style="dim",
-    ))
-
-    mode_choice = Prompt.ask(
-        "  What type of node are you running?",
-        choices=["1", "2"],
-        default="2",
-    )
-    node_mode = "gateway" if mode_choice == "1" else "client"
-    mode_label = "Gateway" if node_mode == "gateway" else "Client"
-    console.print(f"  [green]✓[/] Mode: [bold]{mode_label}[/]")
-    console.print()
-
-    # ─── Step 2: Reticulum config ────────────────────────────────
-    console.print("[bold]── Step 2: Reticulum ──[/]\n")
+    # ─── Step 1: Reticulum config ────────────────────────────────
+    console.print("[bold]── Step 1: Reticulum ──[/]\n")
 
     default_rns_dir = str(Path.home() / ".reticulum")
     rns_dir = Prompt.ask(
@@ -1245,8 +1218,8 @@ def cmd_setup(args):
 
     console.print()
 
-    # ─── Step 3: Network Interfaces ──────────────────────────────
-    console.print("[bold]── Step 3: Network Interfaces ──[/]\n")
+    # ─── Step 2: Network Interfaces ──────────────────────────────
+    console.print("[bold]── Step 2: Network Interfaces ──[/]\n")
 
     # Show existing interfaces if config exists
     existing_ifaces = []
@@ -1264,22 +1237,15 @@ def cmd_setup(args):
     if rns_config_file.exists():
         _fix_darwin_autointerface(rns_config_file, console)
 
-    # Mode-aware interface prompts
-    if node_mode == "gateway":
-        # Gateway: Lead with TCP Server
-        console.print("  [dim]As a gateway, you'll want a TCP Server so others can connect.[/]")
-        console.print()
-        _setup_add_interfaces(rns_config_file, console, lead_with="server")
-    else:
-        # Client: Lead with TCP Client, suggest known gateway
-        console.print("  [dim]As a client, connect to a gateway to join the network.[/]")
-        console.print()
-        _setup_add_interfaces(rns_config_file, console, lead_with="client")
+    # Ask whether to lead with server or client interface
+    console.print("  [dim]Add TCP Server if others connect to you, TCP Client to connect to a gateway.[/]")
+    console.print()
+    _setup_add_interfaces(rns_config_file, console, lead_with="server")
 
     console.print()
 
     # I2P support (optional)
-    i2p_enabled = _setup_i2p(rns_config_file, console, node_mode)
+    i2p_enabled = _setup_i2p(rns_config_file, console)
 
     console.print()
 
@@ -1295,24 +1261,24 @@ def cmd_setup(args):
     registry_node_name = ""
     if i2p_enabled:
         registry_enabled, registry_publish, registry_auto_connect, registry_node_name = (
-            _setup_registry(console, node_mode)
+            _setup_registry(console)
         )
         console.print()
 
-    # ─── Step 4: Security Preset ─────────────────────────────────
-    console.print("[bold]── Step 4: Security Preset ──[/]\n")
+    # ─── Step 3: Security Preset ─────────────────────────────────
+    console.print("[bold]── Step 3: Security Preset ──[/]\n")
 
-    from .presets import list_presets, MODE_PRESETS
+    from .presets import list_presets
 
-    mode_presets = list_presets(node_mode)
+    all_presets = list_presets()
 
     # Build display panel and choice map
     preset_lines = []
     preset_map = {}
-    recommended = "balanced" if node_mode == "gateway" else "standard"
+    recommended = "balanced"
     default_choice = "1"
 
-    for i, preset in enumerate(mode_presets, 1):
+    for i, preset in enumerate(all_presets, 1):
         name = preset["name"]
         desc = preset["description"]
         rec = " [dim](recommended)[/]" if name == recommended else ""
@@ -1332,8 +1298,8 @@ def cmd_setup(args):
     console.print(f"  [green]✓[/] Selected: [bold]{preset_name}[/]")
     console.print()
 
-    # ─── Step 5: Options ─────────────────────────────────────────
-    console.print("[bold]── Step 5: Options ──[/]\n")
+    # ─── Step 4: Options ─────────────────────────────────────────
+    console.print("[bold]── Step 4: Options ──[/]\n")
 
     is_observe = preset_name in ("observe", "relaxed")
 
@@ -1350,20 +1316,17 @@ def cmd_setup(args):
         default=is_observe,
     )
 
-    if node_mode == "gateway":
-        enable_metrics = Confirm.ask(
-            "\n  Enable Prometheus metrics endpoint?\n"
-            "  [dim]Exposes metrics at http://127.0.0.1:9777/metrics[/]",
-            default=True,
-        )
-        enable_eventstore = Confirm.ask(
-            "\n  Enable persistent event history?\n"
-            "  [dim]Stores security events in SQLite for later analysis.[/]",
-            default=True,
-        )
-    else:
-        enable_metrics = False
-        enable_eventstore = False
+    enable_metrics = Confirm.ask(
+        "\n  Enable Prometheus metrics endpoint?\n"
+        "  [dim]Exposes metrics at http://127.0.0.1:9777/metrics[/]",
+        default=False,
+    )
+
+    enable_eventstore = Confirm.ask(
+        "\n  Enable persistent event history?\n"
+        "  [dim]Stores security events in SQLite for later analysis.[/]",
+        default=False,
+    )
 
     default_sock = DEFAULT_SOCKET
     sock_path = Prompt.ask(
@@ -1379,7 +1342,6 @@ def cmd_setup(args):
     config = apply_preset(preset_name)
 
     # Apply user choices (override preset defaults)
-    config["general"]["node_mode"] = node_mode
     config["general"]["dry_run"] = dry_run
     config["general"]["control_socket"] = sock_path
     config["general"]["reticulum_config_path"] = str(rns_dir) if str(rns_dir) != default_rns_dir else ""
@@ -1662,12 +1624,16 @@ def _setup_lora(rns_config_file: Path, console) -> bool:
         return False
 
 
-def _setup_i2p(rns_config_file: Path, console, node_mode: str) -> bool:
+def _setup_i2p(rns_config_file: Path, console) -> bool:
     """Ask whether to enable I2P support and handle install/config.
 
     Installs i2pd if needed, starts the service (non-blocking), and
     writes an I2PInterface to the RNS config. SAM API readiness and
     tunnel establishment are runtime concerns handled by the daemon.
+
+    The I2P interface is configured as connectable=True (server mode)
+    so the node can both accept inbound connections and connect to peers.
+    Peer connections are added at runtime via the TUI Interfaces tab.
 
     Returns True if I2P was successfully configured.
     """
@@ -1685,18 +1651,16 @@ def _setup_i2p(rns_config_file: Path, console, node_mode: str) -> bool:
         console.print("  [yellow]i2pd could not be installed — I2P will not be available[/]")
         return False
 
-    connectable = (node_mode == "gateway")
-    iface_name = "I2P Gateway" if connectable else "I2P Interface"
+    iface_name = "I2P Interface"
     _ensure_rns_config(rns_config_file)
-    add_rns_i2p_interface(rns_config_file, iface_name, connectable=connectable)
+    add_rns_i2p_interface(rns_config_file, iface_name, connectable=True)
     console.print(f"  [green]✓[/] I2P interface configured ({iface_name})")
-    if connectable:
-        console.print("  [dim]Your B32 address will appear in the TUI Interfaces tab once the tunnel is up[/]")
+    console.print("  [dim]Your B32 address will appear in the TUI Interfaces tab once the tunnel is up[/]")
     console.print("  [dim]Add I2P peers anytime from the TUI Interfaces tab[/]")
     return True
 
 
-def _setup_registry(console, node_mode: str) -> tuple[bool, bool, bool, str]:
+def _setup_registry(console) -> tuple[bool, bool, bool, str]:
     """Ask whether to enable the Gateway Registry.
 
     Returns (enabled, publish, auto_connect, node_name).
@@ -1709,17 +1673,15 @@ def _setup_registry(console, node_mode: str) -> tuple[bool, bool, bool, str]:
     if not Confirm.ask("  Enable gateway registry?", default=True):
         return False, False, False, ""
 
-    publish = False
-    if node_mode == "gateway":
-        publish = Confirm.ask(
-            "\n  Publish this node to the registry?\n"
-            "  [dim]Other nodes can discover and connect to you.[/]",
-            default=True,
-        )
+    publish = Confirm.ask(
+        "\n  Publish this node to the registry?\n"
+        "  [dim]Other nodes can discover and connect to you.[/]",
+        default=False,
+    )
 
     auto_connect = Confirm.ask(
         "\n  Auto-discover and connect to gateways?",
-        default=(node_mode == "client"),
+        default=True,
     )
 
     node_name = Prompt.ask(
