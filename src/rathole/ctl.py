@@ -1600,13 +1600,8 @@ def _setup_lora(rns_config_file: Path, console) -> bool:
     except ValueError:
         txpower = DEFAULT_RNODE_PARAMS["txpower"]
 
-    # Interface mode
-    console.print()
-    console.print("  Interface mode:")
-    console.print("    [bold]1.[/] access_point — LoRa gateway / access point (recommended)")
-    console.print("    [bold]2.[/] full         — Full transport node")
-    mode_choice = Prompt.ask("  Mode", choices=["1", "2"], default="1")
-    iface_mode = "access_point" if mode_choice == "1" else "full"
+    # mode is always access_point — RNode mode cannot be changed via rnodeconf at runtime
+    iface_mode = "access_point"
 
     # Interface name
     iface_name = f"LoRa {port}"
@@ -1625,7 +1620,7 @@ def _setup_lora(rns_config_file: Path, console) -> bool:
         )
         console.print()
         console.print(f"  [green]✓[/] LoRa interface configured: [bold]{iface_name}[/]")
-        console.print(f"  [dim]Freq: {frequency/1e6:.3f} MHz  SF{sf}  BW: {bandwidth//1000} kHz  TX: {txpower} dBm  Mode: {iface_mode}[/]")
+        console.print(f"  [dim]Freq: {frequency/1e6:.3f} MHz  SF{sf}  BW: {bandwidth//1000} kHz  TX: {txpower} dBm[/]")
         console.print("  [dim]Apply the 'lora' preset for LoRa-optimized security settings.[/]")
         return True
     except Exception as e:

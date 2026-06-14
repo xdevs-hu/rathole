@@ -1739,22 +1739,25 @@ class RatholeDaemon:
         """Write the RNodeInterface to the RNS config file for persistence."""
         try:
             from .lora import add_rns_rnode_interface
+            from .ctl import _ensure_rns_config
             rns_config_path = self.config.general.get("reticulum_config_path", "") or None
             if rns_config_path:
                 config_file = Path(rns_config_path) / "config"
             else:
                 config_file = _default_rns_dir() / "config"
-            if config_file.exists():
-                add_rns_rnode_interface(
-                    config_file, name, port,
-                    frequency=frequency,
-                    bandwidth=bandwidth,
-                    txpower=txpower,
-                    spreadingfactor=spreading_factor,
-                    codingrate=coding_rate,
-                    mode=mode,
-                )
-                log.info("Persisted LoRa interface %s (mode=%s) to %s", name, mode, config_file)
+            # Create the config file if it doesn't exist yet so the interface
+            # is persisted even on a first-run or non-default-path setup.
+            _ensure_rns_config(config_file)
+            add_rns_rnode_interface(
+                config_file, name, port,
+                frequency=frequency,
+                bandwidth=bandwidth,
+                txpower=txpower,
+                spreadingfactor=spreading_factor,
+                codingrate=coding_rate,
+                mode=mode,
+            )
+            log.info("Persisted LoRa interface %s (mode=%s) to %s", name, mode, config_file)
         except Exception as e:
             log.warning("LoRa interface active but failed to persist: %s", e)
 

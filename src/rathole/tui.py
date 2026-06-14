@@ -542,6 +542,7 @@ def _build_tui(sock_path: str, refresh_interval: float = 5.0,
                 yield Button("Start I2P Server", id="i2p-server-btn", variant="primary")
             yield Vertical(id="i2p-peers-list")
             # LoRa: two mutually exclusive rows toggled by _update_lora_section()
+            # mode is always "access_point" — hardcoded, not user-selectable
             with Horizontal(id="lora-inputs-form"):
                 yield Input(placeholder="Serial port (e.g. /dev/ttyUSB0)", id="lora-port-input")
                 yield Input(placeholder="Freq Hz (e.g. 868000000)", id="lora-freq-input")
@@ -549,11 +550,6 @@ def _build_tui(sock_path: str, refresh_interval: float = 5.0,
                 yield Input(placeholder="BW Hz (e.g. 125000)", id="lora-bw-input")
                 yield Input(placeholder="TX Power dBm (2-23)", id="lora-txpower-input")
                 yield Input(placeholder="CR 5-8 (default 5)", id="lora-cr-input")
-                yield Select(
-                    [("Access Point", "access_point"), ("Full", "full")],
-                    value="access_point",
-                    id="lora-mode-select",
-                )
                 yield Button("Add LoRa", id="lora-add-btn", variant="success")
             with Horizontal(id="lora-active-info"):
                 yield Static("", id="lora-active-text")
@@ -862,10 +858,6 @@ def _build_tui(sock_path: str, refresh_interval: float = 5.0,
 
         #lora-cr-input {
             width: 10;
-        }
-
-        #lora-mode-select {
-            width: 16;
         }
 
         #registry-section-header {
@@ -1784,6 +1776,8 @@ def _build_tui(sock_path: str, refresh_interval: float = 5.0,
 
             When a LoRa interface is active:
               - Hide #lora-inputs-form, show #lora-active-info with config summary.
+              - If the interface is not yet online (radio initialising), show
+                "Connecting…" instead of "● LoRa active" — mirrors the I2P pattern.
             When no LoRa interface is active:
               - Show #lora-inputs-form (pre-filled if last config is known), hide #lora-active-info.
             """
@@ -1805,6 +1799,10 @@ def _build_tui(sock_path: str, refresh_interval: float = 5.0,
                 bw = iface.get("bandwidth", "?")
                 txp = iface.get("txpower", "?")
                 cr = iface.get("cr", "?")
+                # online=None means the optimistic pre-poll entry (just added);
+                # online=False means the interface exists in Transport but radio
+                # is still initialising; online=True means fully up.
+                is_online = iface.get("online", None)
 
                 # Format frequency / bandwidth nicely
                 try:
@@ -1819,8 +1817,14 @@ def _build_tui(sock_path: str, refresh_interval: float = 5.0,
                 iface_mode = iface.get("mode", "")
                 mode_str = f"  Mode: [cyan]{iface_mode}[/]" if iface_mode else ""
 
+                # Status bullet — mirrors I2P "Connecting…" / "Connected" pattern
+                if is_online:
+                    status_bullet = "[bold green]● LoRa active[/]"
+                else:
+                    status_bullet = "[bold yellow]● Connecting…[/]"
+
                 info = (
-                    f"[bold green]● LoRa active[/]  [dim]{name}[/]\n"
+                    f"{status_bullet}  [dim]{name}[/]\n"
                     f"  Port: [cyan]{port}[/]  "
                     f"Freq: [cyan]{freq_str}[/]  "
                     f"SF: [cyan]{sf}[/]  "
@@ -2626,14 +2630,8 @@ def _build_tui(sock_path: str, refresh_interval: float = 5.0,
                     self.notify("Coding rate must be 5–8 (4/5 through 4/8)", severity="error")
                     return
 
-                # Read mode from the Select widget (defaults to "access_point")
-                try:
-                    from textual.widgets.select import NoSelection
-                    mode_sel = self.query_one("#lora-mode-select", Select)
-                    raw_mode = mode_sel.value
-                    lora_mode = "access_point" if isinstance(raw_mode, NoSelection) else str(raw_mode)
-                except Exception:
-                    lora_mode = "access_point"
+                # mode is always access_point — RNode mode cannot be changed via rnodeconf at runtime
+                lora_mode = "access_point"
 
                 self.notify(f"Adding LoRa interface on {port}…", severity="information")
                 resp = self._send("add_lora_interface", {
@@ -2650,7 +2648,7 @@ def _build_tui(sock_path: str, refresh_interval: float = 5.0,
                     freq_mhz = frequency / 1e6
                     bw_khz = bandwidth / 1000
                     self.notify(
-                        f"LoRa added: {name} ({freq_mhz:.3f} MHz SF{sf} BW{bw_khz:.0f}kHz {txpower}dBm CR4/{cr} mode={lora_mode})",
+                        f"LoRa added: {name} ({freq_mhz:.3f} MHz SF{sf} BW{bw_khz:.0f}kHz {txpower}dBm CR4/{cr})",
                         severity="information",
                     )
                     self.notify(
@@ -2671,6 +2669,7 @@ def _build_tui(sock_path: str, refresh_interval: float = 5.0,
                         "txpower": txpower,
                         "cr": cr,
                         "mode": lora_mode,
+                        "online": False,  # Radio initialising — show Connecting… until first poll
                     }]
                     self.call_from_thread(self._update_lora_section, _lora_iface)
                     self.refresh_data()
