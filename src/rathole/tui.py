@@ -1777,7 +1777,7 @@ def _build_tui(sock_path: str, refresh_interval: float = 5.0,
             When a LoRa interface is active:
               - Hide #lora-inputs-form, show #lora-active-info with config summary.
               - If the interface is not yet online (radio initialising), show
-                "Connecting" instead of "● LoRa active" — mirrors the I2P pattern.
+                "Activating" instead of "● Active" — mirrors the I2P pattern.
             When no LoRa interface is active:
               - Show #lora-inputs-form (pre-filled if last config is known), hide #lora-active-info.
             """
@@ -1821,9 +1821,9 @@ def _build_tui(sock_path: str, refresh_interval: float = 5.0,
 
                 # Status bullet — mirrors I2P "Connecting" / "Connected" pattern
                 if is_online:
-                    status_bullet = "[bold green]● LoRa active[/]"
+                    status_bullet = "[bold green]● Active[/]"
                 else:
-                    status_bullet = "[bold yellow]● Connecting[/]"
+                    status_bullet = "[bold yellow]● Activating[/]"
 
                 info = (
                     f"{status_bullet}  [dim]{name}[/]{mode_paren}\n"
@@ -2670,7 +2670,7 @@ def _build_tui(sock_path: str, refresh_interval: float = 5.0,
                         "txpower": txpower,
                         "cr": cr,
                         "mode": lora_mode,
-                        "online": False,  # Radio initialising — show Connecting until first poll
+                        "online": False,  # Radio initialising — show Activating until first poll
                     }]
                     self.call_from_thread(self._update_lora_section, _lora_iface)
                     self.refresh_data()
