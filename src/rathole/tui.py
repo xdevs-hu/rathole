@@ -120,7 +120,7 @@ def _build_tui(sock_path: str, refresh_interval: float = 5.0,
         def render(self) -> str:
             s = self.stats
             if not s:
-                return "[dim]  Connecting...[/]"
+                return "[dim]  Connecting[/]"
 
             uptime = s.get("uptime", 0)
             h, m = int(uptime // 3600), int((uptime % 3600) // 60)
@@ -1777,7 +1777,7 @@ def _build_tui(sock_path: str, refresh_interval: float = 5.0,
             When a LoRa interface is active:
               - Hide #lora-inputs-form, show #lora-active-info with config summary.
               - If the interface is not yet online (radio initialising), show
-                "Connecting…" instead of "● LoRa active" — mirrors the I2P pattern.
+                "Connecting" instead of "● LoRa active" — mirrors the I2P pattern.
             When no LoRa interface is active:
               - Show #lora-inputs-form (pre-filled if last config is known), hide #lora-active-info.
             """
@@ -1815,23 +1815,24 @@ def _build_tui(sock_path: str, refresh_interval: float = 5.0,
                     bw_str = str(bw)
 
                 iface_mode = iface.get("mode", "")
-                mode_str = f"  Mode: [cyan]{iface_mode}[/]" if iface_mode else ""
+                # Format mode for display: "access_point" → "Access Point"
+                mode_display = iface_mode.replace("_", " ").title() if iface_mode else ""
+                mode_paren = f"  [dim](Mode: {mode_display})[/]" if mode_display else ""
 
-                # Status bullet — mirrors I2P "Connecting…" / "Connected" pattern
+                # Status bullet — mirrors I2P "Connecting" / "Connected" pattern
                 if is_online:
                     status_bullet = "[bold green]● LoRa active[/]"
                 else:
-                    status_bullet = "[bold yellow]● Connecting…[/]"
+                    status_bullet = "[bold yellow]● Connecting[/]"
 
                 info = (
-                    f"{status_bullet}  [dim]{name}[/]\n"
+                    f"{status_bullet}  [dim]{name}[/]{mode_paren}\n"
                     f"  Port: [cyan]{port}[/]  "
                     f"Freq: [cyan]{freq_str}[/]  "
                     f"SF: [cyan]{sf}[/]  "
                     f"BW: [cyan]{bw_str}[/]  "
                     f"TX: [cyan]{txp} dBm[/]  "
                     f"CR: [cyan]4/{cr}[/]"
-                    + (f"  {mode_str}" if iface_mode else "")
                 )
                 active_text.update(info)
                 inputs_form.display = False
@@ -1885,7 +1886,7 @@ def _build_tui(sock_path: str, refresh_interval: float = 5.0,
               ● Connected  (green)  — iface.online=True (Status: Up)
               ● Checking…  (yellow) — interface present but Status: Down,
                                       tunnel was connected before (new=False)
-              ● Connecting… (yellow) — first-time add (new=True) or interface
+              ● Connecting (yellow) — first-time add (new=True) or interface
                                       not yet in Transport
 
             The daemon enriches each peer entry with ``connected``, ``present``
@@ -1911,12 +1912,12 @@ def _build_tui(sock_path: str, refresh_interval: float = 5.0,
                 # Use daemon-supplied flags (enriched in status command):
                 #   connected=True              → Status: Up  → Connected
                 #   connected=False, new=True   → first-time add, tunnel not yet up
-                #                                 → Connecting…
+                #                                 → Connecting
                 #   connected=False, present,
                 #     new=False                 → interface exists but Status: Down
                 #                                 (post-restart check or re-establishing)
                 #                                 → Checking…
-                #   connected=False, !present   → not in transport at all → Connecting…
+                #   connected=False, !present   → not in transport at all → Connecting
                 is_connected = bool(peer.get("connected", False))
                 is_present   = bool(peer.get("present", False))
                 is_new       = bool(peer.get("new", False))
@@ -1926,7 +1927,7 @@ def _build_tui(sock_path: str, refresh_interval: float = 5.0,
                 elif is_present and not is_new:
                     bullet = "[bold yellow]●[/] [bold yellow]Checking…[/]"
                 else:
-                    bullet = "[bold yellow]●[/] [bold yellow]Connecting…[/]"
+                    bullet = "[bold yellow]●[/] [bold yellow]Connecting[/]"
 
                 safe_id = name.replace(" ", "_").replace(".", "_")
                 row = Horizontal(classes="i2p-peer-row")
@@ -2669,7 +2670,7 @@ def _build_tui(sock_path: str, refresh_interval: float = 5.0,
                         "txpower": txpower,
                         "cr": cr,
                         "mode": lora_mode,
-                        "online": False,  # Radio initialising — show Connecting… until first poll
+                        "online": False,  # Radio initialising — show Connecting until first poll
                     }]
                     self.call_from_thread(self._update_lora_section, _lora_iface)
                     self.refresh_data()

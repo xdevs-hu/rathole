@@ -1463,7 +1463,7 @@ class RatholeDaemon:
             interface = RNS_I2PInterface(RNS.Transport, config)
             self._rns_instance._add_interface(interface)
             self._i2p_interfaces.append(interface)
-            # Mark as "new" so the TUI shows "Connecting…" (first-time tunnel
+            # Mark as "new" so the TUI shows "Connecting" (first-time tunnel
             # establishment) rather than "Checking…" (status poll after reconnect).
             # The flag is cleared once the peer becomes connected for the first time.
             self._i2p_peers.append({"name": name, "b32": b32_address, "new": True})
@@ -1605,6 +1605,7 @@ class RatholeDaemon:
         try:
             import RNS
             from RNS.Interfaces.RNodeInterface import RNodeInterface
+            from RNS.Interfaces.Interface import Interface as _RNSIface
 
             name = f"LoRa {port}"
             # Duplicate check
@@ -1620,6 +1621,23 @@ class RatholeDaemon:
                 log.error("LoRa serial port check failed: %s", port_err)
                 return {"ok": False, "error": port_err}
 
+            # Translate the human-readable mode string to the RNS integer constant.
+            #
+            # BUG FIX: _add_interface(interface) with no mode= argument defaults to
+            # MODE_FULL (= 1), which is why `rnstatus` showed "Mode: Full" even though
+            # the persisted config file correctly contained `mode = access_point`.
+            # The "mode" key in the config dict passed to RNodeInterface() is ignored
+            # by the constructor — mode is set exclusively by _add_interface(mode=).
+            _mode_map = {
+                "access_point":   _RNSIface.MODE_ACCESS_POINT,    # 3
+                "full":           _RNSIface.MODE_FULL,             # 1
+                "gateway":        _RNSIface.MODE_GATEWAY,          # 6
+                "roaming":        _RNSIface.MODE_ROAMING,          # 4
+                "boundary":       _RNSIface.MODE_BOUNDARY,         # 5
+                "point_to_point": _RNSIface.MODE_POINT_TO_POINT,   # 2
+            }
+            interface_mode = _mode_map.get(mode.lower(), _RNSIface.MODE_ACCESS_POINT)
+
             config = {
                 "name": name,
                 "mode": mode,
@@ -1632,7 +1650,7 @@ class RatholeDaemon:
                 "enabled": "yes",
             }
             interface = RNodeInterface(RNS.Transport, config)
-            self._rns_instance._add_interface(interface)
+            self._rns_instance._add_interface(interface, mode=interface_mode)
             log.info(
                 "Added LoRa interface: %s (mode=%s, freq=%d Hz, SF%d, BW=%d Hz, %d dBm)",
                 name, mode, frequency, spreading_factor, bandwidth, txpower,

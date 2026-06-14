@@ -218,6 +218,16 @@ def detect_lora_interfaces() -> list[dict[str, Any]]:
                 val = getattr(iface, attr, None)
                 if val is not None:
                     info[attr] = val
+            # Mode — RNS stores mode as an int (e.g. 3 = ACCESS_POINT).
+            # Convert to a human-readable string for the TUI.
+            _mode_raw = getattr(iface, "mode", None)
+            _MODE_NAMES = {0: "full", 1: "gateway", 2: "client", 3: "access_point"}
+            if isinstance(_mode_raw, int):
+                info["mode"] = _MODE_NAMES.get(_mode_raw, f"mode_{_mode_raw}")
+            elif _mode_raw:
+                info["mode"] = str(_mode_raw)
+            else:
+                info["mode"] = "access_point"
             results.append(info)
     except Exception as e:
         log.debug("detect_lora_interfaces: %s", e)
