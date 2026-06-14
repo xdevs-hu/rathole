@@ -1161,7 +1161,8 @@ class RatholeDaemon:
                 return {"ok": False, "error": f"Invalid radio parameter: {e}"}
             if not (2 <= txpower <= 23):
                 return {"ok": False, "error": "txpower must be 2–23 dBm"}
-            return self._add_lora_interface(port, frequency, bandwidth, txpower, sf, cr)
+            mode = str(args.get("mode", "access_point")).strip() or "access_point"
+            return self._add_lora_interface(port, frequency, bandwidth, txpower, sf, cr, mode=mode)
         elif cmd == "remove_lora_interface":
             name = args.get("name", "").strip()
             if not name:
@@ -1593,8 +1594,14 @@ class RatholeDaemon:
         txpower: int = 17,
         spreading_factor: int = 8,
         coding_rate: int = 5,
+        mode: str = "access_point",
     ) -> dict:
-        """Add an RNodeInterface (LoRa) at runtime."""
+        """Add an RNodeInterface (LoRa) at runtime.
+
+        Args:
+            mode: RNS interface mode written to the config — ``"access_point"``
+                  (default) or ``"full"``.
+        """
         try:
             import RNS
             from RNS.Interfaces.RNodeInterface import RNodeInterface
@@ -1615,6 +1622,7 @@ class RatholeDaemon:
 
             config = {
                 "name": name,
+                "mode": mode,
                 "port": port,
                 "frequency": str(frequency),
                 "bandwidth": str(bandwidth),
@@ -1626,11 +1634,11 @@ class RatholeDaemon:
             interface = RNodeInterface(RNS.Transport, config)
             self._rns_instance._add_interface(interface)
             log.info(
-                "Added LoRa interface: %s (freq=%d Hz, SF%d, BW=%d Hz, %d dBm)",
-                name, frequency, spreading_factor, bandwidth, txpower,
+                "Added LoRa interface: %s (mode=%s, freq=%d Hz, SF%d, BW=%d Hz, %d dBm)",
+                name, mode, frequency, spreading_factor, bandwidth, txpower,
             )
 
-            self._persist_lora_interface(name, port, frequency, bandwidth, txpower, spreading_factor, coding_rate)
+            self._persist_lora_interface(name, port, frequency, bandwidth, txpower, spreading_factor, coding_rate, mode=mode)
 
             return {
                 "ok": True,
@@ -1641,6 +1649,7 @@ class RatholeDaemon:
                 "txpower": txpower,
                 "spreading_factor": spreading_factor,
                 "coding_rate": coding_rate,
+                "mode": mode,
             }
         except ImportError:
             return {"ok": False, "error": "RNodeInterface not available in this RNS version"}
@@ -1725,6 +1734,7 @@ class RatholeDaemon:
         txpower: int,
         spreading_factor: int,
         coding_rate: int,
+        mode: str = "access_point",
     ):
         """Write the RNodeInterface to the RNS config file for persistence."""
         try:
@@ -1742,8 +1752,9 @@ class RatholeDaemon:
                     txpower=txpower,
                     spreadingfactor=spreading_factor,
                     codingrate=coding_rate,
+                    mode=mode,
                 )
-                log.info("Persisted LoRa interface %s to %s", name, config_file)
+                log.info("Persisted LoRa interface %s (mode=%s) to %s", name, mode, config_file)
         except Exception as e:
             log.warning("LoRa interface active but failed to persist: %s", e)
 

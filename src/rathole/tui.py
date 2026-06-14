@@ -549,6 +549,11 @@ def _build_tui(sock_path: str, refresh_interval: float = 5.0,
                 yield Input(placeholder="BW Hz (e.g. 125000)", id="lora-bw-input")
                 yield Input(placeholder="TX Power dBm (2-23)", id="lora-txpower-input")
                 yield Input(placeholder="CR 5-8 (default 5)", id="lora-cr-input")
+                yield Select(
+                    [("Access Point", "access_point"), ("Full", "full")],
+                    value="access_point",
+                    id="lora-mode-select",
+                )
                 yield Button("Add LoRa", id="lora-add-btn", variant="success")
             with Horizontal(id="lora-active-info"):
                 yield Static("", id="lora-active-text")
@@ -857,6 +862,10 @@ def _build_tui(sock_path: str, refresh_interval: float = 5.0,
 
         #lora-cr-input {
             width: 10;
+        }
+
+        #lora-mode-select {
+            width: 16;
         }
 
         #registry-section-header {
@@ -1807,6 +1816,9 @@ def _build_tui(sock_path: str, refresh_interval: float = 5.0,
                 except Exception:
                     bw_str = str(bw)
 
+                iface_mode = iface.get("mode", "")
+                mode_str = f"  Mode: [cyan]{iface_mode}[/]" if iface_mode else ""
+
                 info = (
                     f"[bold green]● LoRa active[/]  [dim]{name}[/]\n"
                     f"  Port: [cyan]{port}[/]  "
@@ -1815,6 +1827,7 @@ def _build_tui(sock_path: str, refresh_interval: float = 5.0,
                     f"BW: [cyan]{bw_str}[/]  "
                     f"TX: [cyan]{txp} dBm[/]  "
                     f"CR: [cyan]4/{cr}[/]"
+                    + (f"  {mode_str}" if iface_mode else "")
                 )
                 active_text.update(info)
                 inputs_form.display = False
@@ -2613,6 +2626,15 @@ def _build_tui(sock_path: str, refresh_interval: float = 5.0,
                     self.notify("Coding rate must be 5–8 (4/5 through 4/8)", severity="error")
                     return
 
+                # Read mode from the Select widget (defaults to "access_point")
+                try:
+                    from textual.widgets.select import NoSelection
+                    mode_sel = self.query_one("#lora-mode-select", Select)
+                    raw_mode = mode_sel.value
+                    lora_mode = "access_point" if isinstance(raw_mode, NoSelection) else str(raw_mode)
+                except Exception:
+                    lora_mode = "access_point"
+
                 self.notify(f"Adding LoRa interface on {port}…", severity="information")
                 resp = self._send("add_lora_interface", {
                     "port": port,
@@ -2621,13 +2643,14 @@ def _build_tui(sock_path: str, refresh_interval: float = 5.0,
                     "bandwidth": bandwidth,
                     "txpower": txpower,
                     "coding_rate": cr,
+                    "mode": lora_mode,
                 })
                 if resp.get("ok"):
                     name = resp.get("name", port)
                     freq_mhz = frequency / 1e6
                     bw_khz = bandwidth / 1000
                     self.notify(
-                        f"LoRa added: {name} ({freq_mhz:.3f} MHz SF{sf} BW{bw_khz:.0f}kHz {txpower}dBm CR4/{cr})",
+                        f"LoRa added: {name} ({freq_mhz:.3f} MHz SF{sf} BW{bw_khz:.0f}kHz {txpower}dBm CR4/{cr} mode={lora_mode})",
                         severity="information",
                     )
                     self.notify(
@@ -2647,6 +2670,7 @@ def _build_tui(sock_path: str, refresh_interval: float = 5.0,
                         "bandwidth": bandwidth,
                         "txpower": txpower,
                         "cr": cr,
+                        "mode": lora_mode,
                     }]
                     self.call_from_thread(self._update_lora_section, _lora_iface)
                     self.refresh_data()

@@ -285,8 +285,14 @@ def add_rns_rnode_interface(
     spreadingfactor: int = DEFAULT_RNODE_PARAMS["spreadingfactor"],
     codingrate: int = DEFAULT_RNODE_PARAMS["codingrate"],
     enabled: bool = True,
+    mode: str = "access_point",
 ):
     """Write an RNodeInterface section to an RNS config file.
+
+    Args:
+        mode: RNS interface mode — ``"access_point"`` (default, acts as a
+              LoRa access point / gateway) or ``"full"`` (full transport node).
+              Written as ``mode = <value>`` in the interface section.
 
     Uses configobj if available, falls back to text append.
     """
@@ -299,6 +305,7 @@ def add_rns_rnode_interface(
         iface_cfg = {
             "type": "RNodeInterface",
             "enabled": "yes" if enabled else "no",
+            "mode": mode,
             "port": port,
             "frequency": str(frequency),
             "bandwidth": str(bandwidth),
@@ -308,12 +315,13 @@ def add_rns_rnode_interface(
         }
         cfg["interfaces"][name] = iface_cfg
         cfg.write()
-        log.info("Added RNodeInterface %r to %s", name, config_file)
+        log.info("Added RNodeInterface %r (mode=%s) to %s", name, mode, config_file)
     except ImportError:
         # Text fallback
         entry = f"\n  [[{name}]]\n"
         entry += "    type = RNodeInterface\n"
         entry += f"    enabled = {'yes' if enabled else 'no'}\n"
+        entry += f"    mode = {mode}\n"
         entry += f"    port = {port}\n"
         entry += f"    frequency = {frequency}\n"
         entry += f"    bandwidth = {bandwidth}\n"
@@ -327,7 +335,7 @@ def add_rns_rnode_interface(
         else:
             text += "\n[interfaces]\n" + entry
         config_file.write_text(text)
-        log.info("Added RNodeInterface %r to %s (text fallback)", name, config_file)
+        log.info("Added RNodeInterface %r (mode=%s) to %s (text fallback)", name, mode, config_file)
 
 
 def remove_rns_lora_interface(config_file: Path, name: str) -> bool:
