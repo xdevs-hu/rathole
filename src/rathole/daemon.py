@@ -96,7 +96,9 @@ class RatholeDaemon:
         self._ready = threading.Event()   # Set once control socket is listening
         self._rns_instance = None
         self._i2p_interfaces: list = []
-        self._i2p_peers: list[dict] = []  # [{name, b32}] for peer (non-server) interfaces
+        self._i2p_peers: list[dict] = []    # [{name, b32}] for peer (non-server) interfaces
+        self._tcp_peers: list[dict] = []    # [{name, host, port}] for TCP client interfaces
+        self._tcp_servers: list[dict] = []  # [{name, listen_ip, port}] for TCP server interfaces
         self._ctl_thread: threading.Thread | None = None
 
     def init(self, install_signals: bool = True):
@@ -133,6 +135,12 @@ class RatholeDaemon:
         # that were persisted in the RNS config are already live in Transport.interfaces
         # but _i2p_peers starts empty.  Scan and backfill so the TUI shows them.
         self._sync_i2p_peers_from_transport()
+
+        # Same backfill for TCP client interfaces persisted in the RNS config.
+        self._sync_tcp_peers_from_transport()
+
+        # Backfill TCP server interfaces persisted in the RNS config.
+        self._sync_tcp_servers_from_transport()
 
         # Install the Transport hook
         install_hook(self.router)
@@ -918,6 +926,79 @@ class RatholeDaemon:
                     "present": _is_online or _is_down,
                 })
             stats["i2p_peers"] = _enriched_peers
+
+            # Enrich tcp_peers with live connection status by scanning Transport.interfaces.
+            # TCPClientInterface name is "TCP <host>:<port>" — exact match.
+            # Three states mirror the I2P pattern:
+            #   connected=True  — interface present and online=True
+            #   connected=False, present=True  — interface present but online=False
+            #                                    (reconnecting after drop)
+            #   connected=False, present=False — not in transport (first-time connect)
+            try:
+                import RNS as _RNS
+                _tcp_live_online: set[str] = set()
+                _tcp_live_down: set[str] = set()
+                for _iface in _RNS.Transport.interfaces:
+                    _iname = getattr(_iface, "name", "")
+                    _itype = type(_iface).__name__
+                    if "TCPClient" in _itype:
+                        if getattr(_iface, "online", True):
+                            _tcp_live_online.add(_iname)
+                        else:
+                            _tcp_live_down.add(_iname)
+            except Exception:
+                _tcp_live_online = set()
+                _tcp_live_down = set()
+
+            _enriched_tcp = []
+            for _tp in self._tcp_peers:
+                _tname = _tp.get("name", "")
+                _t_online = _tname in _tcp_live_online
+                _t_down   = _tname in _tcp_live_down
+                if _t_online and _tp.get("new"):
+                    _tp["new"] = False
+                _enriched_tcp.append({
+                    **_tp,
+                    "connected": _t_online,
+                    "present": _t_online or _t_down,
+                })
+            stats["tcp_peers"] = _enriched_tcp
+
+            # Enrich tcp_servers with live listening status.
+            # TCPServerInterface name is "TCP Server <ip>:<port>" — exact match.
+            # Two states:
+            #   listening=True  — interface present and online=True  (bound and accepting)
+            #   listening=False — interface present but online=False (binding / activating)
+            try:
+                import RNS as _RNS
+                _srv_live_online: set[str] = set()
+                _srv_live_down: set[str] = set()
+                for _iface in _RNS.Transport.interfaces:
+                    _iname = getattr(_iface, "name", "")
+                    _itype = type(_iface).__name__
+                    if "TCPServer" in _itype:
+                        if getattr(_iface, "online", True):
+                            _srv_live_online.add(_iname)
+                        else:
+                            _srv_live_down.add(_iname)
+            except Exception:
+                _srv_live_online = set()
+                _srv_live_down = set()
+
+            _enriched_servers = []
+            for _sv in self._tcp_servers:
+                _svname = _sv.get("name", "")
+                _sv_online = _svname in _srv_live_online
+                _sv_down   = _svname in _srv_live_down
+                if _sv_online and _sv.get("new"):
+                    _sv["new"] = False
+                _enriched_servers.append({
+                    **_sv,
+                    "listening": _sv_online,
+                    "present": _sv_online or _sv_down,
+                })
+            stats["tcp_servers"] = _enriched_servers
+
             from .lora import detect_lora_interfaces
             stats["lora_interfaces"] = detect_lora_interfaces()
             peers = self._enrich_peers(self.state.peer_summary())
@@ -1137,6 +1218,16 @@ class RatholeDaemon:
             except (ValueError, TypeError):
                 return {"ok": False, "error": "port must be 1-65535"}
             return self._add_tcp_client_interface(host, port)
+        elif cmd == "remove_tcp_peer":
+            name = args.get("name", "").strip()
+            if not name:
+                return {"ok": False, "error": "name required (e.g. 'TCP 1.2.3.4:4242')"}
+            return self._remove_tcp_client_interface(name)
+        elif cmd == "remove_tcp_server":
+            name = args.get("name", "").strip()
+            if not name:
+                return {"ok": False, "error": "name required (e.g. 'TCP Server 0.0.0.0:4242')"}
+            return self._remove_tcp_server_interface(name)
         elif cmd == "add_tcp_server":
             listen_ip = args.get("listen_ip", "0.0.0.0").strip()
             port = args.get("port", 0)
@@ -1246,14 +1337,29 @@ class RatholeDaemon:
             from RNS.Interfaces.TCPInterface import TCPClientInterface
 
             name = f"TCP {host}:{port}"
+
+            # Duplicate check — also guard against stale Down objects left after
+            # a previous remove() (same pattern as I2P peer re-add logic).
+            tracked_names = {p.get("name", "") for p in self._tcp_peers}
             for iface in RNS.Transport.interfaces:
                 if getattr(iface, "name", "") == name:
+                    if name not in tracked_names:
+                        # Previously removed, stale Down object — allow re-add
+                        log.info(
+                            "TCP peer %s found in transport but not tracked "
+                            "(previously removed, likely Down) — allowing re-add",
+                            name,
+                        )
+                        continue
                     return {"ok": False, "error": f"Already connected to {host}:{port}"}
 
             config = {"name": name, "target_host": host, "target_port": str(port)}
             interface = TCPClientInterface(RNS.Transport, config)
             self._rns_instance._add_interface(interface)
             log.info("Added TCP client interface: %s:%d", host, port)
+
+            # Track with "new" flag so TUI shows "Connecting" on first add
+            self._tcp_peers.append({"name": name, "host": host, "port": port, "new": True})
 
             self._persist_tcp_interface(name, host, port)
 
@@ -1262,6 +1368,143 @@ class RatholeDaemon:
             log.error("Failed to add TCP interface %s:%d: %s", host, port, e)
             return {"ok": False, "error": str(e)}
 
+    def _remove_tcp_client_interface(self, name: str) -> dict:
+        """Detach a live TCP client interface by name and remove it from the RNS config.
+
+        Mirrors _remove_i2p_peer_interface: detaches the interface object,
+        clears in-memory tracking, and removes the section from the RNS config
+        so it does not reappear after restart.
+        """
+        try:
+            import RNS
+
+            is_shared_client = getattr(
+                self._rns_instance, "is_connected_to_shared_instance", False
+            )
+
+            target = None
+            for iface in list(RNS.Transport.interfaces):
+                if getattr(iface, "name", "") == name:
+                    target = iface
+                    break
+
+            if target is None:
+                log.debug("TCP client interface %s not found in live transport", name)
+            else:
+                try:
+                    if hasattr(target, "detach"):
+                        target.detach()
+                except Exception as e:
+                    log.warning("Error detaching TCP client interface %s: %s", name, e)
+
+                try:
+                    RNS.Transport.interfaces.remove(target)
+                except (ValueError, AttributeError):
+                    pass
+
+                try:
+                    remaining = [
+                        i for i in RNS.Transport.interfaces
+                        if getattr(i, "name", "") != name
+                    ]
+                    if len(remaining) < len(RNS.Transport.interfaces):
+                        RNS.Transport.interfaces[:] = remaining
+                except Exception as e:
+                    log.debug("Could not filter transport interfaces: %s", e)
+
+            # Remove from in-memory tracking
+            self._tcp_peers = [p for p in self._tcp_peers if p.get("name") != name]
+
+            # Remove from RNS config file
+            self._unpersist_tcp_interface(name)
+
+            if is_shared_client:
+                log.info(
+                    "TCP peer %s detached (interface marked Down) and removed from config.",
+                    name,
+                )
+            else:
+                log.info("Removed TCP client interface: %s", name)
+
+            return {"ok": True, "name": name}
+        except Exception as e:
+            log.error("Failed to remove TCP client interface %s: %s", name, e)
+            return {"ok": False, "error": str(e)}
+
+    def _unpersist_tcp_interface(self, name: str):
+        """Remove a named TCPClientInterface section from the RNS config file."""
+        try:
+            from .ctl import _remove_rns_interface
+            rns_config_path = self.config.general.get("reticulum_config_path", "") or None
+            if rns_config_path:
+                config_file = Path(rns_config_path) / "config"
+            else:
+                config_file = _default_rns_dir() / "config"
+            if config_file.exists():
+                removed = _remove_rns_interface(config_file, name)
+                if removed:
+                    log.info("Removed TCP interface %s from %s", name, config_file)
+                else:
+                    log.debug("TCP interface %s not found in %s (already removed?)", name, config_file)
+        except Exception as e:
+            log.warning("Failed to unpersist TCP interface %s: %s", name, e)
+
+    def _sync_tcp_peers_from_transport(self):
+        """Backfill _tcp_peers from the RNS config file at startup.
+
+        Called once after _init_reticulum().  Reads persisted TCPClientInterface
+        sections from the RNS config file and populates _tcp_peers so the TUI
+        shows them immediately on a fresh start without requiring a manual add.
+
+        The status (Connecting/Connected) is determined at runtime by the
+        status command scanning RNS.Transport.interfaces every 5 seconds.
+        """
+        try:
+            from .ctl import _list_rns_interfaces
+            rns_config_path = self.config.general.get("reticulum_config_path", "") or None
+            if rns_config_path:
+                config_file = Path(rns_config_path) / "config"
+            else:
+                config_file = _default_rns_dir() / "config"
+
+            if not config_file.exists():
+                return
+
+            # Read raw config to find TCPClientInterface sections
+            try:
+                from configobj import ConfigObj
+                cfg = ConfigObj(str(config_file))
+                ifaces = cfg.get("interfaces", {})
+            except ImportError:
+                ifaces = {}
+
+            existing_names = {p.get("name", "") for p in self._tcp_peers}
+            count = 0
+            for iface_name, iface_cfg in ifaces.items():
+                if not isinstance(iface_cfg, dict):
+                    continue
+                if iface_cfg.get("type", "").strip() != "TCPClientInterface":
+                    continue
+                host = iface_cfg.get("target_host", "").strip()
+                port_str = iface_cfg.get("target_port", "").strip()
+                if not host or not port_str:
+                    continue
+                try:
+                    port = int(port_str)
+                except ValueError:
+                    continue
+                name = iface_name.strip()
+                if name in existing_names:
+                    continue
+                self._tcp_peers.append({"name": name, "host": host, "port": port})
+                existing_names.add(name)
+                count += 1
+                log.info("Loaded TCP peer from config at startup: %s (%s:%d)", name, host, port)
+            if count:
+                log.info("Backfilled %d TCP peer(s) from RNS config", count)
+        except Exception as e:
+            log.warning("Could not load TCP peers from config at startup: %s", e)
+
     def _add_tcp_server_interface(self, listen_ip: str, port: int) -> dict:
         """Add a TCP server (listener) interface at runtime."""
         try:
@@ -1269,8 +1512,18 @@ class RatholeDaemon:
             from RNS.Interfaces.TCPInterface import TCPServerInterface
 
             name = f"TCP Server {listen_ip}:{port}"
+
+            # Duplicate check — skip stale Down objects not in tracking (re-add after remove)
+            tracked_names = {s.get("name", "") for s in self._tcp_servers}
             for iface in RNS.Transport.interfaces:
                 if getattr(iface, "name", "") == name:
+                    if name not in tracked_names:
+                        log.info(
+                            "TCP server %s found in transport but not tracked "
+                            "(previously removed, likely Down) — allowing re-add",
+                            name,
+                        )
+                        continue
                     return {"ok": False, "error": f"Already listening on {listen_ip}:{port}"}
 
             config = {"name": name, "listen_ip": listen_ip, "listen_port": str(port)}
@@ -1278,12 +1531,142 @@ class RatholeDaemon:
             self._rns_instance._add_interface(interface)
             log.info("Added TCP server interface: %s:%d", listen_ip, port)
 
+            # Track with "new" flag so TUI shows "Activating" on first add
+            self._tcp_servers.append({"name": name, "listen_ip": listen_ip, "port": port, "new": True})
+
             self._persist_tcp_server_interface(name, listen_ip, port)
 
             return {"ok": True, "name": name}
         except Exception as e:
             log.error("Failed to add TCP server %s:%d: %s", listen_ip, port, e)
             return {"ok": False, "error": str(e)}
+
+    def _remove_tcp_server_interface(self, name: str) -> dict:
+        """Detach a live TCP server interface by name and remove it from the RNS config."""
+        try:
+            import RNS
+
+            is_shared_client = getattr(
+                self._rns_instance, "is_connected_to_shared_instance", False
+            )
+
+            target = None
+            for iface in list(RNS.Transport.interfaces):
+                if getattr(iface, "name", "") == name:
+                    target = iface
+                    break
+
+            if target is None:
+                log.debug("TCP server interface %s not found in live transport", name)
+            else:
+                try:
+                    if hasattr(target, "detach"):
+                        target.detach()
+                except Exception as e:
+                    log.warning("Error detaching TCP server interface %s: %s", name, e)
+
+                try:
+                    RNS.Transport.interfaces.remove(target)
+                except (ValueError, AttributeError):
+                    pass
+
+                try:
+                    remaining = [
+                        i for i in RNS.Transport.interfaces
+                        if getattr(i, "name", "") != name
+                    ]
+                    if len(remaining) < len(RNS.Transport.interfaces):
+                        RNS.Transport.interfaces[:] = remaining
+                except Exception as e:
+                    log.debug("Could not filter transport interfaces: %s", e)
+
+            # Remove from in-memory tracking
+            self._tcp_servers = [s for s in self._tcp_servers if s.get("name") != name]
+
+            # Remove from RNS config file
+            self._unpersist_tcp_server_interface(name)
+
+            if is_shared_client:
+                log.info(
+                    "TCP server %s detached (interface marked Down) and removed from config.",
+                    name,
+                )
+            else:
+                log.info("Removed TCP server interface: %s", name)
+
+            return {"ok": True, "name": name}
+        except Exception as e:
+            log.error("Failed to remove TCP server interface %s: %s", name, e)
+            return {"ok": False, "error": str(e)}
+
+    def _unpersist_tcp_server_interface(self, name: str):
+        """Remove a named TCPServerInterface section from the RNS config file."""
+        try:
+            from .ctl import _remove_rns_interface
+            rns_config_path = self.config.general.get("reticulum_config_path", "") or None
+            if rns_config_path:
+                config_file = Path(rns_config_path) / "config"
+            else:
+                config_file = _default_rns_dir() / "config"
+            if config_file.exists():
+                removed = _remove_rns_interface(config_file, name)
+                if removed:
+                    log.info("Removed TCP server %s from %s", name, config_file)
+                else:
+                    log.debug("TCP server %s not found in %s (already removed?)", name, config_file)
+        except Exception as e:
+            log.warning("Failed to unpersist TCP server %s: %s", name, e)
+
+    def _sync_tcp_servers_from_transport(self):
+        """Backfill _tcp_servers from the RNS config file at startup.
+
+        Called once after _init_reticulum().  Reads persisted TCPServerInterface
+        sections from the RNS config file and populates _tcp_servers so the TUI
+        shows them immediately on a fresh start without requiring a manual add.
+        """
+        try:
+            rns_config_path = self.config.general.get("reticulum_config_path", "") or None
+            if rns_config_path:
+                config_file = Path(rns_config_path) / "config"
+            else:
+                config_file = _default_rns_dir() / "config"
+
+            if not config_file.exists():
+                return
+
+            try:
+                from configobj import ConfigObj
+                cfg = ConfigObj(str(config_file))
+                ifaces = cfg.get("interfaces", {})
+            except ImportError:
+                ifaces = {}
+
+            existing_names = {s.get("name", "") for s in self._tcp_servers}
+            count = 0
+            for iface_name, iface_cfg in ifaces.items():
+                if not isinstance(iface_cfg, dict):
+                    continue
+                if iface_cfg.get("type", "").strip() != "TCPServerInterface":
+                    continue
+                listen_ip = iface_cfg.get("listen_ip", "0.0.0.0").strip()
+                port_str = iface_cfg.get("listen_port", "").strip()
+                if not port_str:
+                    continue
+                try:
+                    port = int(port_str)
+                except ValueError:
+                    continue
+                name = iface_name.strip()
+                if name in existing_names:
+                    continue
+                self._tcp_servers.append({"name": name, "listen_ip": listen_ip, "port": port})
+                existing_names.add(name)
+                count += 1
+                log.info("Loaded TCP server from config at startup: %s (%s:%d)", name, listen_ip, port)
+            if count:
+                log.info("Backfilled %d TCP server(s) from RNS config", count)
+        except Exception as e:
+            log.warning("Could not load TCP servers from config at startup: %s", e)
 
     def _persist_tcp_server_interface(self, name: str, listen_ip: str, port: int):
         """Write the TCP server interface to RNS config for persistence."""

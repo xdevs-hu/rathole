@@ -151,6 +151,34 @@ def _build_tui(sock_path: str, refresh_interval: float = 5.0,
             else:
                 mode_badge = "[bold green]CLIENT[/]"
 
+            # TCP peers summary line (only shown when at least one TCP peer exists)
+            tcp_peers = s.get("tcp_peers", [])
+            if tcp_peers:
+                tcp_up    = sum(1 for p in tcp_peers if p.get("connected"))
+                tcp_total = len(tcp_peers)
+                if tcp_up == tcp_total:
+                    tcp_line = f"\n  [green]TCP[/] {tcp_up}/{tcp_total} up"
+                elif tcp_up > 0:
+                    tcp_line = f"\n  [yellow]TCP[/] {tcp_up}/{tcp_total} up"
+                else:
+                    tcp_line = f"\n  [dim]TCP[/] {tcp_up}/{tcp_total} up"
+            else:
+                tcp_line = ""
+
+            # TCP servers summary line (only shown when at least one server exists)
+            tcp_servers = s.get("tcp_servers", [])
+            if tcp_servers:
+                srv_up    = sum(1 for sv in tcp_servers if sv.get("listening"))
+                srv_total = len(tcp_servers)
+                if srv_up == srv_total:
+                    srv_line = f"\n  [green]SRV[/] {srv_up}/{srv_total} listening"
+                elif srv_up > 0:
+                    srv_line = f"\n  [yellow]SRV[/] {srv_up}/{srv_total} listening"
+                else:
+                    srv_line = f"\n  [yellow]SRV[/] {srv_up}/{srv_total} activating"
+            else:
+                srv_line = ""
+
             # I2P address (if available)
             i2p_b32 = s.get("i2p_b32")
             if i2p_b32:
@@ -173,7 +201,7 @@ def _build_tui(sock_path: str, refresh_interval: float = 5.0,
 
             return (
                 f"[bold]RATHOLE[/]\n"
-                f"  {mode_badge}{i2p_line}\n"
+                f"  {mode_badge}{tcp_line}{srv_line}{i2p_line}\n"
                 f"{sep}\n"
                 f"  {mode}\n"
                 f"  ↑ {h}h {m}m\n"
@@ -536,6 +564,8 @@ def _build_tui(sock_path: str, refresh_interval: float = 5.0,
                 yield Input(placeholder="Port (e.g. 4242)", id="iface-port-input")
                 yield Button("Connect TCP", id="iface-connect-btn", variant="success")
                 yield Button("Listen TCP", id="tcp-server-btn", variant="primary")
+            yield Vertical(id="tcp-peers-list")
+            yield Vertical(id="tcp-servers-list")
             with Horizontal(id="i2p-add-form"):
                 yield Input(placeholder="I2P B32 address", id="i2p-b32-input")
                 yield Button("Connect I2P", id="i2p-connect-btn", variant="success")
@@ -791,6 +821,54 @@ def _build_tui(sock_path: str, refresh_interval: float = 5.0,
             padding: 0 1;
         }
 
+        #tcp-peers-list {
+            height: auto;
+            padding: 0 1;
+        }
+
+        .tcp-peer-row {
+            height: 3;
+            padding: 0 0;
+            align: left middle;
+        }
+
+        .tcp-peer-label {
+            width: 1fr;
+            height: 100%;
+            content-align-vertical: middle;
+            padding: 0 1;
+        }
+
+        .tcp-peer-remove-btn {
+            width: auto;
+            min-width: 16;
+            margin-left: 1;
+        }
+
+        #tcp-servers-list {
+            height: auto;
+            padding: 0 1;
+        }
+
+        .tcp-server-row {
+            height: 3;
+            padding: 0 0;
+            align: left middle;
+        }
+
+        .tcp-server-label {
+            width: 1fr;
+            height: 100%;
+            content-align-vertical: middle;
+            padding: 0 1;
+        }
+
+        .tcp-server-remove-btn {
+            width: auto;
+            min-width: 18;
+            margin-left: 1;
+        }
+
         #i2p-peers-list {
             height: auto;
             padding: 0 1;
@@ -897,6 +975,10 @@ def _build_tui(sock_path: str, refresh_interval: float = 5.0,
         }
 
         #peer-actions Button, #bh-add-form Button, #iface-add-form Button, #i2p-add-form Button, #lora-inputs-form Button, #lora-active-info Button {
+            margin-left: 1;
+        }
+
+        .tcp-peer-remove-btn, .tcp-server-remove-btn, .i2p-peer-remove-btn {
             margin-left: 1;
         }
 
@@ -1331,6 +1413,14 @@ def _build_tui(sock_path: str, refresh_interval: float = 5.0,
             self.call_from_thread(
                 self._update_lora_section,
                 stats.get("lora_interfaces", []),
+            )
+            self.call_from_thread(
+                self._update_tcp_peers_list,
+                stats.get("tcp_peers", []),
+            )
+            self.call_from_thread(
+                self._update_tcp_servers_list,
+                stats.get("tcp_servers", []),
             )
             self.call_from_thread(
                 self._update_i2p_display,
@@ -1877,6 +1967,106 @@ def _build_tui(sock_path: str, refresh_interval: float = 5.0,
             except Exception:
                 pass
 
+        def _update_tcp_peers_list(self, peers: list):
+            """Render one row per TCP client peer connection below the iface-add-form.
+
+            Each row shows: ● <status>  <name>  [Remove TCP]
+
+            Three status states (daemon-supplied flags):
+              ● Connected  (green)  — iface.online=True
+              ● Checking…  (yellow) — interface present but online=False,
+                                      was connected before (new=False)
+              ● Connecting (yellow) — first-time add (new=True) or interface
+                                      not yet in Transport
+            """
+            try:
+                container = self.query_one("#tcp-peers-list", Vertical)
+            except Exception:
+                return
+
+            container.remove_children()
+            container.display = bool(peers)
+
+            for peer in peers:
+                name = peer.get("name", "")
+                host = peer.get("host", "")
+                port = peer.get("port", "")
+                display_label = f"{host}:{port}" if host and port else name
+
+                is_connected = bool(peer.get("connected", False))
+                is_present   = bool(peer.get("present", False))
+                is_new       = bool(peer.get("new", False))
+
+                if is_connected:
+                    bullet = "[bold green]●[/] [bold green]Connected[/]"
+                elif is_present and not is_new:
+                    bullet = "[bold yellow]●[/] [bold yellow]Checking…[/]"
+                else:
+                    bullet = "[bold yellow]●[/] [bold yellow]Connecting[/]"
+
+                safe_id = name.replace(" ", "_").replace(":", "_").replace(".", "_")
+                row = Horizontal(classes="tcp-peer-row")
+                label = Static(
+                    f"{bullet}  [cyan]{display_label}[/]",
+                    classes="tcp-peer-label",
+                )
+                btn = Button(
+                    "Remove TCP",
+                    id=f"tcp-peer-remove-{safe_id}",
+                    classes="tcp-peer-remove-btn",
+                    variant="warning",
+                )
+                container.mount(row)
+                row.mount(label)
+                row.mount(btn)
+
+        def _update_tcp_servers_list(self, servers: list):
+            """Render one row per TCP server (listener) below the tcp-peers-list.
+
+            Two status states (daemon-supplied flags):
+              ● Listening   (green)  — iface.online=True  (bound and accepting)
+              ● Activating  (yellow) — interface present but not yet online,
+                                       or first-time add (new=True)
+            """
+            try:
+                container = self.query_one("#tcp-servers-list", Vertical)
+            except Exception:
+                return
+
+            container.remove_children()
+            container.display = bool(servers)
+
+            for srv in servers:
+                name = srv.get("name", "")
+                listen_ip = srv.get("listen_ip", "")
+                port = srv.get("port", "")
+                display_label = f"{listen_ip}:{port}" if listen_ip and port else name
+
+                is_listening = bool(srv.get("listening", False))
+                is_present   = bool(srv.get("present", False))
+                is_new       = bool(srv.get("new", False))
+
+                if is_listening:
+                    bullet = "[bold green]●[/] [bold green]Listening[/]"
+                else:
+                    bullet = "[bold yellow]●[/] [bold yellow]Activating[/]"
+
+                safe_id = name.replace(" ", "_").replace(":", "_").replace(".", "_")
+                row = Horizontal(classes="tcp-server-row")
+                label = Static(
+                    f"{bullet}  [cyan]{display_label}[/]",
+                    classes="tcp-server-label",
+                )
+                btn = Button(
+                    "Remove Server",
+                    id=f"tcp-server-remove-{safe_id}",
+                    classes="tcp-server-remove-btn",
+                    variant="warning",
+                )
+                container.mount(row)
+                row.mount(label)
+                row.mount(btn)
+
         def _update_i2p_peers_list(self, peers: list):
             """Render one row per I2P peer connection below the i2p-add-form.
 
@@ -2408,6 +2598,12 @@ def _build_tui(sock_path: str, refresh_interval: float = 5.0,
                 self._handle_interface_connect()
             elif button_id == "tcp-server-btn":
                 self._handle_tcp_server()
+            elif button_id.startswith("tcp-peer-remove-"):
+                safe_id = button_id[len("tcp-peer-remove-"):]
+                self._handle_tcp_peer_remove(safe_id)
+            elif button_id.startswith("tcp-server-remove-"):
+                safe_id = button_id[len("tcp-server-remove-"):]
+                self._handle_tcp_server_remove(safe_id)
             elif button_id == "i2p-connect-btn":
                 self._handle_i2p_connect()
             elif button_id == "i2p-server-btn":
@@ -2534,6 +2730,76 @@ def _build_tui(sock_path: str, refresh_interval: float = 5.0,
                     name = resp.get("name", b32[:16])
                     self.notify(f"I2P peer added: {name}", severity="information")
                     self.call_from_thread(lambda: b32_input.__setattr__("value", ""))
+                    self.refresh_data()
+                else:
+                    self.notify(f"Error: {resp.get('error', '?')}", severity="error")
+            except Exception as e:
+                self.notify(f"Error: {e}", severity="error")
+
+        @work(thread=True)
+        def _handle_tcp_server_remove(self, safe_id: str) -> None:
+            """Remove a TCP server interface by its safe_id.
+
+            Reconstructs the original interface name by scanning the daemon's
+            current tcp_servers list for a name whose safe form matches safe_id.
+            """
+            try:
+                status_resp = self._send("status")
+                servers = status_resp.get("stats", {}).get("tcp_servers", [])
+
+                target_name = None
+                for srv in servers:
+                    name = srv.get("name", "")
+                    candidate_id = name.replace(" ", "_").replace(":", "_").replace(".", "_")
+                    if candidate_id == safe_id:
+                        target_name = name
+                        break
+
+                if not target_name:
+                    target_name = safe_id.replace("_", " ", 2)
+
+                resp = self._send("remove_tcp_server", {"name": target_name})
+                if resp.get("ok"):
+                    self.notify(
+                        f"Removed TCP server: {target_name}",
+                        severity="information",
+                    )
+                    self.refresh_data()
+                else:
+                    self.notify(f"Error: {resp.get('error', '?')}", severity="error")
+            except Exception as e:
+                self.notify(f"Error: {e}", severity="error")
+
+        @work(thread=True)
+        def _handle_tcp_peer_remove(self, safe_id: str) -> None:
+            """Remove a TCP client peer interface by its safe_id.
+
+            Reconstructs the original interface name by scanning the daemon's
+            current tcp_peers list for a name whose safe form matches safe_id.
+            """
+            try:
+                # Fetch current peers from daemon to find the real name
+                status_resp = self._send("status")
+                peers = status_resp.get("stats", {}).get("tcp_peers", [])
+
+                target_name = None
+                for peer in peers:
+                    name = peer.get("name", "")
+                    candidate_id = name.replace(" ", "_").replace(":", "_").replace(".", "_")
+                    if candidate_id == safe_id:
+                        target_name = name
+                        break
+
+                if not target_name:
+                    # Fallback: reconstruct from safe_id best-effort
+                    target_name = safe_id.replace("_", " ", 1)
+
+                resp = self._send("remove_tcp_peer", {"name": target_name})
+                if resp.get("ok"):
+                    self.notify(
+                        f"Removed TCP peer: {target_name}",
+                        severity="information",
+                    )
                     self.refresh_data()
                 else:
                     self.notify(f"Error: {resp.get('error', '?')}", severity="error")
