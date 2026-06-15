@@ -1422,14 +1422,18 @@ def _build_tui(sock_path: str, refresh_interval: float = 5.0,
                 self._update_tcp_servers_list,
                 stats.get("tcp_servers", []),
             )
+            i2p_b32 = stats.get("i2p_b32")
+            i2p_pending = stats.get("i2p_pending", False)
             self.call_from_thread(
                 self._update_i2p_display,
-                stats.get("i2p_b32"),
-                stats.get("i2p_pending", False),
+                i2p_b32,
+                i2p_pending,
             )
             self.call_from_thread(
                 self._update_i2p_peers_list,
                 stats.get("i2p_peers", []),
+                i2p_b32,
+                i2p_pending,
             )
 
             # Registry status + gateway list
@@ -1945,25 +1949,29 @@ def _build_tui(sock_path: str, refresh_interval: float = 5.0,
                 active_info.display = False
 
         def _update_i2p_display(self, i2p_b32, i2p_pending=False):
+            # The address is shown in the i2p-peers-list self-address row;
+            # clear the separate display widget so it doesn't duplicate.
             try:
                 widget = self.query_one("#i2p-b32-display", Static)
-                if i2p_b32:
-                    widget.update(
-                        f"\n[dark_goldenrod]Your I2P address:[/]\n"
-                        f"[bold]{i2p_b32}[/]\n"
-                    )
-                elif i2p_pending:
-                    widget.update(
-                        "\n[dim]I2P tunnel establishing — B32 address will appear here…[/]\n"
-                    )
-                else:
-                    widget.update("")
+                widget.update("")
             except Exception:
                 pass
-            # Show/hide copy button
+            # Show/hide copy button (only when B32 is known)
             try:
                 btn = self.query_one("#i2p-b32-copy-btn", Button)
                 btn.display = bool(i2p_b32)
+            except Exception:
+                pass
+            # Toggle Start/Stop I2P Server button
+            server_active = bool(i2p_b32 or i2p_pending)
+            try:
+                srv_btn = self.query_one("#i2p-server-btn", Button)
+                if server_active:
+                    srv_btn.label = "Stop I2P Server"
+                    srv_btn.variant = "warning"
+                else:
+                    srv_btn.label = "Start I2P Server"
+                    srv_btn.variant = "primary"
             except Exception:
                 pass
 
@@ -2067,10 +2075,14 @@ def _build_tui(sock_path: str, refresh_interval: float = 5.0,
                 row.mount(label)
                 row.mount(btn)
 
-        def _update_i2p_peers_list(self, peers: list):
+        def _update_i2p_peers_list(self, peers: list, i2p_b32=None, i2p_pending=False):
             """Render one row per I2P peer connection below the i2p-add-form.
 
-            Each row shows: ● <status>  <full b32>  [Remove I2P]
+            When the local I2P server is active (i2p_b32 set or i2p_pending),
+            a non-removable self-address row is prepended:
+              ● Listening  <b32>  (Your I2P address)
+
+            Each outbound peer row shows: ● <status>  <full b32>  [Remove I2P]
 
             Three status states (daemon-supplied flags):
               ● Connected  (green)  — iface.online=True (Status: Up)
@@ -2092,10 +2104,29 @@ def _build_tui(sock_path: str, refresh_interval: float = 5.0,
 
             # Remove all existing peer rows and rebuild
             container.remove_children()
-            # Hide when empty so it contributes zero height; the margin-top on
-            # the LoRa forms provides the consistent 1-cell gap instead.
-            container.display = bool(peers)
 
+            server_active = bool(i2p_b32 or i2p_pending)
+            has_content = server_active or bool(peers)
+            container.display = has_content
+
+            # ── Self-address row (server listening) ──────────────
+            if server_active:
+                if i2p_b32:
+                    bullet = "[bold green]●[/] [bold green]Listening[/]"
+                    addr_text = f"{i2p_b32} [dim](Your I2P address)[/]"
+                else:
+                    bullet = "[bold yellow]●[/] [bold yellow]Establishing…[/]"
+                    addr_text = "[dim]B32 address pending… (Your I2P address)[/]"
+
+                self_row = Horizontal(classes="i2p-peer-row")
+                self_label = Static(
+                    f"{bullet}  {addr_text}",
+                    classes="i2p-peer-label",
+                )
+                container.mount(self_row)
+                self_row.mount(self_label)
+
+            # ── Outbound peer rows ────────────────────────────────
             for peer in peers:
                 name = peer.get("name", "")
                 b32 = peer.get("b32", "")
@@ -2607,7 +2638,16 @@ def _build_tui(sock_path: str, refresh_interval: float = 5.0,
             elif button_id == "i2p-connect-btn":
                 self._handle_i2p_connect()
             elif button_id == "i2p-server-btn":
-                self._handle_i2p_server()
+                # Toggle: if server is active (button reads "Stop…"), stop it;
+                # otherwise start it.
+                try:
+                    srv_btn = self.query_one("#i2p-server-btn", Button)
+                    if str(srv_btn.label).startswith("Stop"):
+                        self._handle_i2p_server_stop()
+                    else:
+                        self._handle_i2p_server()
+                except Exception:
+                    self._handle_i2p_server()
             elif button_id == "lora-add-btn":
                 self._handle_lora_add()
             elif button_id == "lora-remove-btn":
@@ -3003,6 +3043,20 @@ def _build_tui(sock_path: str, refresh_interval: float = 5.0,
                     else:
                         msg += " — B32 address will appear once tunnel is established"
                     self.notify(msg, severity="information")
+                    self.refresh_data()
+                else:
+                    self.notify(f"Error: {resp.get('error', '?')}", severity="error")
+            except Exception as e:
+                self.notify(f"Error: {e}", severity="error")
+
+        @work(thread=True)
+        def _handle_i2p_server_stop(self) -> None:
+            """Stop the local I2P server interface."""
+            try:
+                self.notify("Stopping I2P server…", severity="information")
+                resp = self._send("remove_i2p_server")
+                if resp.get("ok"):
+                    self.notify("I2P server stopped", severity="information")
                     self.refresh_data()
                 else:
                     self.notify(f"Error: {resp.get('error', '?')}", severity="error")

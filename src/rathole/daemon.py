@@ -1261,6 +1261,8 @@ class RatholeDaemon:
             return self._remove_lora_interface(name)
         elif cmd == "add_i2p_server":
             return self._add_i2p_server_interface()
+        elif cmd == "remove_i2p_server":
+            return self._remove_i2p_server_interface()
         elif cmd == "add_i2p_peer":
             b32 = args.get("b32", "").strip()
             if not b32:
@@ -1726,6 +1728,73 @@ class RatholeDaemon:
             return result
         except Exception as e:
             log.error("Failed to add I2P server: %s", e)
+            return {"ok": False, "error": str(e)}
+
+    def _remove_i2p_server_interface(self) -> dict:
+        """Detach and remove the connectable I2P server interface (I2P Gateway).
+
+        Mirrors _remove_i2p_peer_interface() but targets the connectable
+        interface added by _add_i2p_server_interface().  The interface name
+        is always "I2P Gateway" (set in _add_i2p_server_interface).
+        """
+        name = "I2P Gateway"
+        try:
+            import RNS
+
+            is_shared_client = getattr(
+                self._rns_instance, "is_connected_to_shared_instance", False
+            )
+
+            target = None
+            for iface in list(RNS.Transport.interfaces):
+                if "I2P" in type(iface).__name__ and getattr(iface, "connectable", False):
+                    target = iface
+                    name = getattr(iface, "name", name)
+                    break
+
+            if target is None:
+                log.debug("I2P server interface not found in live transport")
+            else:
+                try:
+                    if hasattr(target, "detach"):
+                        target.detach()
+                except Exception as e:
+                    log.warning("Error detaching I2P server interface: %s", e)
+
+                try:
+                    RNS.Transport.interfaces.remove(target)
+                except (ValueError, AttributeError):
+                    pass
+
+                try:
+                    remaining = [
+                        i for i in RNS.Transport.interfaces
+                        if i is not target
+                    ]
+                    if len(remaining) < len(RNS.Transport.interfaces):
+                        RNS.Transport.interfaces[:] = remaining
+                except Exception as e:
+                    log.debug("Could not filter transport interfaces: %s", e)
+
+                self._i2p_interfaces = [
+                    i for i in self._i2p_interfaces if i is not target
+                ]
+
+            # Remove from RNS config file
+            self._unpersist_i2p_interface(name)
+
+            if is_shared_client:
+                log.info(
+                    "I2P server %s detached and removed from config. "
+                    "SAM session may linger in i2pd until rnsd restarts.",
+                    name,
+                )
+            else:
+                log.info("Removed I2P server interface: %s", name)
+
+            return {"ok": True, "name": name}
+        except Exception as e:
+            log.error("Failed to remove I2P server interface: %s", e)
             return {"ok": False, "error": str(e)}
 
     def _persist_i2p_server_interface(self, name: str):
