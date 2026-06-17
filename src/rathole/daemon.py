@@ -2110,6 +2110,22 @@ class RatholeDaemon:
 
             self._persist_lora_interface(name, port, frequency, bandwidth, txpower, spreading_factor, coding_rate, mode=mode)
 
+            # Auto-sync radio parameters into the airtime filter so the
+            # duty-cycle estimator always uses the actual hardware settings.
+            # This prevents the filter from over- or under-counting airtime
+            # when the radio is configured with non-default SF or BW.
+            try:
+                lora_airtime_cfg = self.config.raw.setdefault("filters", {}).setdefault("lora_airtime", {})
+                lora_airtime_cfg["spreading_factor"] = spreading_factor
+                lora_airtime_cfg["bandwidth_hz"] = bandwidth
+                self._propagate_config()
+                log.info(
+                    "Auto-synced lora_airtime filter: SF%d, BW=%d Hz (from LoRa interface %s)",
+                    spreading_factor, bandwidth, name,
+                )
+            except Exception as _sync_err:
+                log.warning("Failed to auto-sync lora_airtime filter params: %s", _sync_err)
+
             return {
                 "ok": True,
                 "name": name,

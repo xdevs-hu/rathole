@@ -204,8 +204,6 @@ FILTER_META: dict[str, FilterInfo] = {
         params={
             "duty_cycle_percent": ParamInfo(label="Duty Cycle %", step=0.1),
             "window_seconds": ParamInfo(label="Window (s)", step=60),
-            "spreading_factor": ParamInfo(label="Spreading Factor", step=1),
-            "bandwidth_hz": ParamInfo(label="Bandwidth (Hz)", step=1000),
         },
     ),
 }

@@ -376,13 +376,10 @@ duty_cycle_percent = 1.0
 # Rolling window in seconds for duty-cycle calculation.
 window_seconds = 3600
 
-# LoRa spreading factor for airtime estimation (7-12).
-# Must match your RNode configuration.
-spreading_factor = 8
-
-# LoRa bandwidth in Hz for airtime estimation.
-# Must match your RNode configuration.
-bandwidth_hz = 125_000
+# Note: spreading_factor and bandwidth_hz are automatically synced from
+# the LoRa device configuration when an RNode interface is added.
+# You do not need to set them here — they are kept in sync with the
+# actual radio hardware settings to ensure accurate airtime estimation.
 
 
 # ═══════════════════════════════════════════════════════════════════

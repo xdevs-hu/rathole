@@ -1250,7 +1250,7 @@ def cmd_setup(args):
     console.print()
 
     # LoRa support (optional)
-    _setup_lora(rns_config_file, console)
+    lora_configured, lora_sf, lora_bw = _setup_lora(rns_config_file, console)
 
     console.print()
 
@@ -1348,6 +1348,17 @@ def cmd_setup(args):
     config["adaptive"]["enabled"] = enable_adaptive
     config["metrics"]["enabled"] = enable_metrics
     config["eventstore"]["enabled"] = enable_eventstore
+
+    # Sync LoRa radio params into the airtime filter so the duty-cycle
+    # estimator uses the actual hardware settings from day one.
+    if lora_configured:
+        config.setdefault("filters", {}).setdefault("lora_airtime", {})
+        config["filters"]["lora_airtime"]["spreading_factor"] = lora_sf
+        config["filters"]["lora_airtime"]["bandwidth_hz"] = lora_bw
+        # Also sync into the top-level [lora] section
+        config.setdefault("lora", {})
+        config["lora"]["spreading_factor"] = lora_sf
+        config["lora"]["bandwidth_hz"] = lora_bw
     if registry_enabled:
         config["registry"]["enabled"] = True
         config["registry"]["publish"] = registry_publish
@@ -1511,13 +1522,16 @@ def _setup_add_interfaces(rns_config_file: Path, console, lead_with: str = "clie
             add_interfaces = False
 
 
-def _setup_lora(rns_config_file: Path, console) -> bool:
+def _setup_lora(rns_config_file: Path, console) -> tuple[bool, int, int]:
     """Ask whether to configure a LoRa (RNode) interface.
 
     Scans for serial ports, prompts for radio parameters, and writes
     an RNodeInterface section to the RNS config.
 
-    Returns True if a LoRa interface was configured.
+    Returns (configured, spreading_factor, bandwidth_hz).
+    configured is True if a LoRa interface was written to the RNS config.
+    spreading_factor and bandwidth_hz reflect the user's chosen radio params
+    so the caller can sync them into filters.lora_airtime.
     """
     from .lora import detect_serial_ports, add_rns_rnode_interface, FREQUENCY_PRESETS, DEFAULT_RNODE_PARAMS
 
@@ -1527,7 +1541,7 @@ def _setup_lora(rns_config_file: Path, console) -> bool:
     console.print()
 
     if not Confirm.ask("  Add a LoRa (RNode) interface?", default=False):
-        return False
+        return False, DEFAULT_RNODE_PARAMS["spreadingfactor"], DEFAULT_RNODE_PARAMS["bandwidth"]
 
     console.print()
 
@@ -1622,10 +1636,10 @@ def _setup_lora(rns_config_file: Path, console) -> bool:
         console.print(f"  [green]✓[/] LoRa interface configured: [bold]{iface_name}[/]")
         console.print(f"  [dim]Freq: {frequency/1e6:.3f} MHz  SF{sf}  BW: {bandwidth//1000} kHz  TX: {txpower} dBm[/]")
         console.print("  [dim]Apply the 'lora' preset for LoRa-optimized security settings.[/]")
-        return True
+        return True, sf, bandwidth
     except Exception as e:
         console.print(f"  [red]✗[/] Failed to write LoRa interface: {e}")
-        return False
+        return False, sf, bandwidth
 
 
 def _setup_i2p(rns_config_file: Path, console) -> bool:
