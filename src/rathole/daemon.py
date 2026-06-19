@@ -454,13 +454,69 @@ class RatholeDaemon:
                  len(iface_names),
                  f" ({', '.join(iface_names)})" if iface_names else "")
 
-    def _ensure_transport_enabled(self, rns_config_path):
-        """Ensure transport mode is enabled in the RNS config before init.
+        # ── Log LoRa interface details at startup ─────────────────────
+        # Prints mode, frequency, SF, BW, and online status for every
+        # RNode/LoRa interface so it's immediately visible in docker logs
+        # whether the radio is configured correctly.
+        if hasattr(RNS.Transport, "interfaces"):
+            for iface in RNS.Transport.interfaces:
+                itype = type(iface).__name__
+                if "RNode" not in itype and "LoRa" not in itype:
+                    continue
+                iname   = getattr(iface, "name", itype)
+                online  = getattr(iface, "online", None)
+                mode_v  = getattr(iface, "mode", None)
+                freq    = getattr(iface, "frequency", None)
+                bw      = getattr(iface, "bandwidth", None)
+                sf      = getattr(iface, "sf", None)
+                cr      = getattr(iface, "cr", None)
+                txpwr   = getattr(iface, "txpower", None)
+                bitrate = getattr(iface, "bitrate", None)
+                _MODE_NAMES = {0: "full", 1: "gateway", 2: "client",
+                               3: "access_point", 4: "roaming",
+                               5: "boundary", 6: "point_to_point"}
+                mode_str = _MODE_NAMES.get(mode_v, f"mode_{mode_v}") if mode_v is not None else "?"
+                log.info(
+                    "LoRa startup: [%s] online=%s mode=%s(%s) "
+                    "freq=%s Hz SF%s BW=%s Hz txpwr=%s dBm bitrate=%s bps",
+                    iname, online, mode_str, mode_v,
+                    freq, sf, bw, txpwr, bitrate,
+                )
+                # Warn explicitly if mode is full — access_point is the expected mode
+                if mode_v == 0:
+                    log.warning(
+                        "LoRa [%s] is in FULL mode — "
+                        "expected access_point mode for a LoRa access point. "
+                        "Check _ensure_transport_enabled() or set mode=access_point in RNS config.",
+                        iname,
+                    )
 
-        Called BEFORE ``RNS.Reticulum()`` so the instance starts with
-        transport already active — all interfaces (TCP, UDP, etc.) spawn
-        correctly on the first initialization, avoiding the need to tear
-        down and re-create the singleton.
+    def _ensure_transport_enabled(self, rns_config_path):
+        """Ensure the RNS config is correct before ``RNS.Reticulum()`` is called.
+
+        Three settings are enforced:
+
+        ``enable_transport = Yes``
+            Rathole is a transport node — it must route announces and serve
+            path requests.  Without this, RNS starts in client mode and the
+            filter hook has nothing to intercept.
+
+        ``share_instance = Yes``
+            Rathole runs alongside rnsd (the shared Reticulum daemon) and
+            connects to it as a shared-instance client.  With
+            ``share_instance = Yes`` (the RNS default) the first
+            ``RNS.Reticulum()`` call in the process becomes the
+            shared-instance owner; subsequent calls (including rathole's own)
+            attach as clients.  This is the correct mode when rnsd already
+            owns the RNodeInterface — rathole does not need to open the serial
+            port directly.
+
+        ``RNodeInterface mode = access_point``
+            In ``access_point`` mode the RNode acts as a LoRa access point /
+            gateway — clients connect to it.  ``full`` mode is for peer
+            transport nodes that also relay traffic between other nodes.
+            Rathole operates as an access point, so ``access_point`` is the
+            correct mode.
         """
         if rns_config_path:
             config_dir = Path(rns_config_path)
@@ -473,54 +529,142 @@ class RatholeDaemon:
             # before init, but transport_enabled() check after will catch it.
             return
 
-        # Check current transport setting
         try:
             from configobj import ConfigObj
             cfg = ConfigObj(str(config_file))
             rns_section = cfg.get("reticulum", {})
-            val = str(rns_section.get("enable_transport", "No")).lower()
-            if val in ("yes", "true", "1"):
-                return  # Already enabled
 
-            # Enable transport
-            if "reticulum" not in cfg:
-                cfg["reticulum"] = {}
-            cfg["reticulum"]["enable_transport"] = "Yes"
-            cfg.write()
-            log.info("Transport auto-enabled in %s", config_file)
+            changed = False
+
+            # Enforce enable_transport = Yes
+            transport_val = str(rns_section.get("enable_transport", "No")).lower()
+            if transport_val not in ("yes", "true", "1"):
+                if "reticulum" not in cfg:
+                    cfg["reticulum"] = {}
+                cfg["reticulum"]["enable_transport"] = "Yes"
+                changed = True
+                log.info("Transport auto-enabled in %s", config_file)
+
+            # Enforce share_instance = Yes
+            # Rathole connects to the shared rnsd instance; it does not need
+            # to own the serial port directly.
+            share_val = str(rns_section.get("share_instance", "Yes")).lower()
+            if share_val not in ("yes", "true", "1"):
+                if "reticulum" not in cfg:
+                    cfg["reticulum"] = {}
+                cfg["reticulum"]["share_instance"] = "Yes"
+                changed = True
+                log.info("share_instance set to Yes in %s (rathole uses shared rnsd instance)",
+                         config_file)
+
+            # Enforce mode = access_point on all RNodeInterface sections.
+            # Rathole operates as a LoRa access point / gateway — clients
+            # connect to it.  If the config was previously set to "full"
+            # (peer transport node mode), correct it to "access_point".
+            ifaces_section = cfg.get("interfaces", {})
+            for iface_name, iface_cfg in ifaces_section.items():
+                if not isinstance(iface_cfg, dict):
+                    continue
+                if iface_cfg.get("type", "").strip() != "RNodeInterface":
+                    continue
+                current_mode = str(iface_cfg.get("mode", "")).strip().lower()
+                if current_mode == "full":
+                    cfg["interfaces"][iface_name]["mode"] = "access_point"
+                    changed = True
+                    log.info(
+                        "RNodeInterface '%s' mode changed full→access_point in %s "
+                        "(rathole operates as a LoRa access point)",
+                        iface_name, config_file,
+                    )
+
+            if changed:
+                cfg.write()
+
         except ImportError:
-            # configobj not installed — try text-based approach
+            # configobj not installed — text-based fallback
             try:
+                import re as _re
                 text = config_file.read_text()
-                # Quick check: is transport already on?
-                for line in text.splitlines():
+                lines = text.splitlines()
+                changed = False
+
+                # Helper: set or insert a key in the [reticulum] section
+                def _set_key(lines, key, value):
+                    # Replace existing key
+                    for i, line in enumerate(lines):
+                        stripped = line.strip().lower()
+                        if stripped.startswith(key.lower()) and "=" in stripped:
+                            lines[i] = f"  {key} = {value}"
+                            return lines, True
+                    # Insert after [reticulum] header
+                    for i, line in enumerate(lines):
+                        if line.strip().lower() == "[reticulum]":
+                            lines.insert(i + 1, f"  {key} = {value}")
+                            return lines, True
+                    return lines, False
+
+                # Check enable_transport
+                transport_ok = False
+                for line in lines:
                     stripped = line.strip().lower()
                     if stripped.startswith("enable_transport") and "=" in stripped:
                         val = stripped.split("=", 1)[1].strip()
                         if val in ("yes", "true", "1"):
-                            return  # Already enabled
-
-                # Enable it via text replacement
-                lines = text.splitlines()
-                found = False
-                for i, line in enumerate(lines):
-                    if line.strip().lower().startswith("enable_transport"):
-                        lines[i] = "  enable_transport = Yes"
-                        found = True
+                            transport_ok = True
                         break
-                if not found:
-                    for i, line in enumerate(lines):
-                        if line.strip().lower() == "[reticulum]":
-                            lines.insert(i + 1, "  enable_transport = Yes")
-                            found = True
-                            break
-                if found:
+                if not transport_ok:
+                    lines, ok = _set_key(lines, "enable_transport", "Yes")
+                    if ok:
+                        changed = True
+                        log.info("Transport auto-enabled in %s", config_file)
+
+                # Check share_instance
+                share_ok = False
+                for line in lines:
+                    stripped = line.strip().lower()
+                    if stripped.startswith("share_instance") and "=" in stripped:
+                        val = stripped.split("=", 1)[1].strip()
+                        if val in ("yes", "true", "1"):
+                            share_ok = True
+                        break
+                if not share_ok:
+                    lines, ok = _set_key(lines, "share_instance", "Yes")
+                    if ok:
+                        changed = True
+                        log.info("share_instance set to Yes in %s", config_file)
+
+                # Fix RNodeInterface mode: full → access_point
+                # Single-pass: track whether we're inside an RNodeInterface
+                # section, then replace mode = full with mode = access_point.
+                new_lines = []
+                in_rnode = False
+                for line in lines:
+                    stripped = line.strip().lower()
+                    # New [[section]] resets context
+                    if stripped.startswith("[[") and stripped.endswith("]]"):
+                        in_rnode = False
+                    # Detect RNodeInterface type line
+                    if stripped.startswith("type") and "=" in stripped:
+                        val = stripped.split("=", 1)[1].strip()
+                        if val == "rnodeinterface":
+                            in_rnode = True
+                    # Fix mode inside an RNodeInterface section
+                    if in_rnode and stripped.startswith("mode") and "=" in stripped:
+                        val = stripped.split("=", 1)[1].strip()
+                        if val == "full":
+                            line = line.replace("full", "access_point")
+                            changed = True
+                            log.info("RNodeInterface mode full→access_point in %s", config_file)
+                    new_lines.append(line)
+                lines = new_lines
+
+                if changed:
                     config_file.write_text("\n".join(lines) + "\n")
-                    log.info("Transport auto-enabled in %s", config_file)
+
             except Exception as e:
-                log.warning("Could not auto-enable transport: %s", e)
+                log.warning("Could not update RNS config: %s", e)
         except Exception as e:
-            log.warning("Could not auto-enable transport: %s", e)
+            log.warning("Could not update RNS config: %s", e)
 
     def _maintenance_loop(self):
         """
@@ -544,7 +688,6 @@ class RatholeDaemon:
         last_registry_heartbeat = time.monotonic()
         last_registry_discover = time.monotonic()
         last_reputation_decay = time.monotonic()
-
         correlator_interval = self.config.correlator.get("interval", 30)
 
         while not self._shutdown.is_set():

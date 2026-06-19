@@ -34,6 +34,7 @@ from .context import (
     CTX_PATH_RESPONSE,
 )
 from .router import PipelineRouter
+from .lora import is_lora_interface
 
 log = logging.getLogger("rathole.hook")
 
@@ -120,8 +121,12 @@ def _extract_context_from_raw(raw: bytes, receiving_interface) -> PacketContext:
 
         # Interface metadata
         if receiving_interface is not None:
-            if hasattr(receiving_interface, "name"):
-                kwargs["interface_name"] = str(receiving_interface.name)
+            # Interface name — fall back to class name so it is never empty
+            iface_name = getattr(receiving_interface, "name", None)
+            if not iface_name:
+                iface_name = type(receiving_interface).__name__
+            kwargs["interface_name"] = str(iface_name)
+
             if hasattr(receiving_interface, "mode"):
                 kwargs["interface_mode"] = receiving_interface.mode
             if hasattr(receiving_interface, "bitrate"):
@@ -132,13 +137,38 @@ def _extract_context_from_raw(raw: bytes, receiving_interface) -> PacketContext:
             # ── LoRa radio metadata ───────────────────────────────
             # RNodeInterface exposes rssi and snr as instance attributes
             # updated per-packet. These are None on non-LoRa interfaces.
+            _is_lora = False
             for _attr, _key in (("rssi", "rssi"), ("snr", "snr"), ("q", "quality")):
                 _val = getattr(receiving_interface, _attr, None)
                 if _val is not None:
                     try:
                         kwargs[_key] = float(_val)
+                        _is_lora = True
                     except (TypeError, ValueError):
                         pass
+            # Also detect LoRa by class name if no radio attrs present yet
+            if not _is_lora:
+                _itype = type(receiving_interface).__name__
+                _is_lora = "RNode" in _itype or "LoRa" in _itype
+
+            # Log LoRa packet receipt at DEBUG so every received frame is visible
+            if _is_lora:
+                _ptype = kwargs.get("packet_type", -1)
+                _ptype_names = {0: "DATA", 1: "ANNOUNCE", 2: "LINKREQUEST", 3: "PROOF"}
+                _ptype_str = _ptype_names.get(_ptype, f"0x{_ptype:02x}" if isinstance(_ptype, int) else "?")
+                _rssi = kwargs.get("rssi")
+                _snr  = kwargs.get("snr")
+                _size = len(raw)
+                _radio = (
+                    f" RSSI={_rssi:.0f}dBm SNR={_snr:.1f}dB" if _rssi is not None and _snr is not None
+                    else f" RSSI={_rssi:.0f}dBm" if _rssi is not None
+                    else ""
+                )
+                log.debug(
+                    "LoRa RX [%s] %s %d bytes hops=%d%s",
+                    kwargs["interface_name"], _ptype_str, _size,
+                    kwargs.get("hop_count", 0), _radio,
+                )
 
             # Peer identity
             peer_hash = ""
@@ -177,6 +207,33 @@ def _hooked_inbound(raw, receiving_interface):
 
     try:
         ctx = _extract_context_from_raw(raw, receiving_interface)
+
+        # ── LoRa announce receipt — always log at INFO ────────────────
+        # This is the single most important visibility point: if a LoRa
+        # client sends an announce and the station receives it, this line
+        # MUST appear in the log.  If it doesn't, the radio is not
+        # delivering packets to Transport.inbound() at all (hardware,
+        # config, or mode issue — not a Rathole issue).
+        if ctx.is_announce and receiving_interface is not None:
+            _itype = type(receiving_interface).__name__
+            if "RNode" in _itype or "LoRa" in _itype or ctx.snr is not None or ctx.rssi is not None:
+                _rssi = ctx.rssi
+                _snr  = ctx.snr
+                _radio = (
+                    f" RSSI={_rssi:.0f}dBm SNR={_snr:.1f}dB"
+                    if _rssi is not None and _snr is not None
+                    else f" RSSI={_rssi:.0f}dBm" if _rssi is not None
+                    else ""
+                )
+                log.info(
+                    "LoRa ANNOUNCE received: dest=%s hops=%d size=%d%s via [%s]",
+                    ctx.destination_hash[:16] if ctx.destination_hash else "?",
+                    ctx.hop_count,
+                    ctx.raw_size,
+                    _radio,
+                    ctx.interface_name or type(receiving_interface).__name__,
+                )
+
         verdict = _router.evaluate(ctx)
 
         if verdict.dropped:
