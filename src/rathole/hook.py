@@ -43,6 +43,11 @@ _original_inbound: Optional[Callable] = None
 _original_path_request_handler: Optional[Callable] = None
 _router: Optional[PipelineRouter] = None
 
+# One-shot warning: emit once per interface name when an announce is accepted
+# but the receiving interface is in access_point mode (announces won't propagate
+# back to LoRa from other interfaces — RNS Transport.outbound() blocks it).
+_ap_mode_warned: set = set()
+
 
 def _extract_context_from_raw(raw: bytes, receiving_interface) -> PacketContext:
     """
@@ -303,6 +308,42 @@ def _hooked_inbound(raw, receiving_interface):
         if receiving_interface is not None and not hasattr(receiving_interface, 'announce_rate_target'):
             receiving_interface.announce_rate_target = None
 
+        # ── AP-mode diagnostic warning ────────────────────────────────────
+        # If this is an announce accepted from a non-LoRa interface (I2P/TCP),
+        # check whether any LoRa interface in Transport is in MODE_ACCESS_POINT.
+        # If so, RNS Transport.outbound() will silently block re-propagation of
+        # this announce to LoRa — the radio shows TX but no new announcements
+        # ever arrive at LoRa devices.
+        #
+        # Emit a one-shot WARNING per affected interface name so the operator
+        # can diagnose the issue without enabling DEBUG logging.
+        if ctx.is_announce and receiving_interface is not None:
+            _itype = type(receiving_interface).__name__
+            _is_non_lora = "RNode" not in _itype and "LoRa" not in _itype
+            if _is_non_lora:
+                try:
+                    import RNS as _RNS
+                    _MODE_AP = 3  # Interface.MODE_ACCESS_POINT
+                    for _iface in _RNS.Transport.interfaces:
+                        _iftype = type(_iface).__name__
+                        if "RNode" not in _iftype and "LoRa" not in _iftype:
+                            continue
+                        _imode = getattr(_iface, "mode", None)
+                        _iname = getattr(_iface, "name", _iftype)
+                        if _imode == _MODE_AP and _iname not in _ap_mode_warned:
+                            _ap_mode_warned.add(_iname)
+                            log.warning(
+                                "ANNOUNCE ROUTING BUG: announce from [%s] accepted by rathole "
+                                "but LoRa interface [%s] is in ACCESS_POINT mode — "
+                                "RNS Transport.outbound() will NOT forward this announce to LoRa! "
+                                "TX traffic visible on LoRa is rnsd heartbeats, NOT new announcements. "
+                                "Fix: set 'mode = full' in the RNS config for [%s] and restart rnsd. "
+                                "Rathole has already patched the config file — restart rnsd to apply.",
+                                ctx.interface_name, _iname, _iname,
+                            )
+                except Exception:
+                    pass
+
         return _original_inbound(raw, receiving_interface)
 
     except Exception as e:
@@ -358,6 +399,44 @@ def _hooked_path_request_handler(data, packet, *args, **kwargs):
         return _original_path_request_handler(data, packet, *args, **kwargs)
 
 
+# One-shot TX logging: track whether we've installed the transmit hook
+_transmit_hook_installed: bool = False
+# Original Transport.transmit reference
+_original_transmit = None
+
+
+def _hooked_transmit(interface, raw):
+    """
+    Replacement for Transport.transmit() that logs announce TX on LoRa interfaces.
+
+    This hook runs in the shared-instance server thread context (same process,
+    same class), so it sees the real LoRa interface objects — unlike inbound()
+    which is called from the client-side stub.
+
+    Logs at INFO when an ANNOUNCE packet is transmitted on a LoRa interface,
+    so operators can confirm I2P→LoRa bridging is working at the radio layer.
+    """
+    global _original_transmit
+
+    if _original_transmit is not None:
+        try:
+            _itype = type(interface).__name__
+            _is_lora = "RNode" in _itype or "LoRa" in _itype
+            if _is_lora and raw and len(raw) >= 2:
+                # Parse packet type from flags byte (bits 1:0)
+                _ptype = raw[0] & 0b00000011
+                if _ptype == 0x01:  # ANNOUNCE
+                    _iname = getattr(interface, "name", _itype)
+                    _hops = raw[1] if len(raw) > 1 else 0
+                    log.info(
+                        "LoRa TX ANNOUNCE: %d bytes hops=%d via [%s]",
+                        len(raw), _hops, _iname,
+                    )
+        except Exception:
+            pass
+        return _original_transmit(interface, raw)
+
+
 def install_hook(router: PipelineRouter):
     """
     Install the Rathole hook into the running RNS Transport.
@@ -365,6 +444,7 @@ def install_hook(router: PipelineRouter):
     Call this AFTER Reticulum has been initialized.
     """
     global _original_inbound, _original_path_request_handler, _router
+    global _original_transmit, _transmit_hook_installed
 
     try:
         import RNS
@@ -388,6 +468,18 @@ def install_hook(router: PipelineRouter):
         log.error("Cannot find Transport.inbound — main hook not installed")
         raise RuntimeError("RNS Transport has no 'inbound' method")
 
+    # Hook Transport.transmit() to log LoRa announce TX.
+    # Transport.transmit() is called by the shared-instance server thread
+    # (same process, same class) when it sends packets out on real interfaces.
+    # This hook runs in the server context and sees the real LoRa interface —
+    # unlike inbound() which is called from the client-side stub for I2P packets.
+    # Logging here confirms whether I2P→LoRa re-propagation is actually happening.
+    if hasattr(RNSTransport, "transmit") and not _transmit_hook_installed:
+        _original_transmit = RNSTransport.transmit
+        RNSTransport.transmit = staticmethod(_hooked_transmit)
+        _transmit_hook_installed = True
+        log.info("Rathole TX hook installed on Transport.transmit() (LoRa announce logging)")
+
     # Hook Transport.path_request_handler() (optional)
     if hasattr(RNSTransport, "path_request_handler"):
         _original_path_request_handler = RNSTransport.path_request_handler
@@ -400,6 +492,7 @@ def install_hook(router: PipelineRouter):
 def uninstall_hook():
     """Restore the original RNS Transport methods."""
     global _original_inbound, _original_path_request_handler, _router
+    global _original_transmit, _transmit_hook_installed
 
     try:
         from RNS import Transport as RNSTransport
@@ -407,6 +500,10 @@ def uninstall_hook():
         if _original_inbound is not None:
             RNSTransport.inbound = _original_inbound
             log.info("Rathole hook removed from Transport.inbound()")
+
+        if _original_transmit is not None:
+            RNSTransport.transmit = _original_transmit
+            log.info("Rathole TX hook removed from Transport.transmit()")
 
         if _original_path_request_handler is not None:
             RNSTransport.path_request_handler = _original_path_request_handler
@@ -417,4 +514,6 @@ def uninstall_hook():
     finally:
         _original_inbound = None
         _original_path_request_handler = None
+        _original_transmit = None
+        _transmit_hook_installed = False
         _router = None

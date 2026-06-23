@@ -507,17 +507,65 @@ class RatholeDaemon:
                     iname, online, mode_str, mode_v,
                     freq, sf, bw, txpwr, bitrate,
                 )
-                # Log mode for visibility (full mode is intentional for testing)
-                if mode_v == 0:
-                    log.info(
-                        "LoRa [%s] is in FULL mode (peer transport node).",
+                # MODE_ACCESS_POINT (3) and MODE_ROAMING (4) both cause RNS
+                # Transport.outbound() to BLOCK announce re-propagation to this
+                # interface when attached_interface=None (the normal announce
+                # re-broadcast path from the announce table).
+                #
+                # Symptom: TX traffic visible on LoRa (rnsd heartbeats/path
+                # responses) but NO new announcements ever arrive at LoRa devices.
+                # The announces from I2P/TCP are accepted by rathole's filter but
+                # silently dropped by RNS before reaching the radio.
+                #
+                # Fix: set mode = full in the RNS config and restart rnsd.
+                # _ensure_transport_enabled() does this automatically before
+                # RNS.Reticulum() is called, so this warning means rnsd was
+                # already running with the wrong mode when rathole started.
+                if mode_v == 3:  # MODE_ACCESS_POINT
+                    log.warning(
+                        "LoRa [%s] is in ACCESS_POINT mode — announces from I2P/TCP "
+                        "will NOT be forwarded to LoRa! "
+                        "RNS Transport.outbound() blocks announce re-propagation on "
+                        "access_point interfaces. "
+                        "Fix: set 'mode = full' in the RNS config for this interface "
+                        "and restart rnsd.",
                         iname,
                     )
+                elif mode_v == 4:  # MODE_ROAMING
+                    log.warning(
+                        "LoRa [%s] is in ROAMING mode — announce re-propagation to "
+                        "LoRa may be restricted. "
+                        "For full I2P↔LoRa bridging, set 'mode = full' in the RNS "
+                        "config and restart rnsd.",
+                        iname,
+                    )
+
+                # Patch announce_cap on the live interface to 50% if it's still at
+                # the default 2%.  _ensure_transport_enabled() writes announce_cap=50
+                # to the config file, but RNS has already read the old config and
+                # initialized the interface with the old cap.  Patching the live
+                # object ensures the fix takes effect immediately without a restart.
+                #
+                # announce_cap is stored as a fraction (0.0–1.0) on the interface object.
+                # RNS default: ANNOUNCE_CAP=2 → 0.02.  Our target: 50% → 0.50.
+                _LORA_CAP_TARGET = 0.50
+                _current_cap = getattr(iface, "announce_cap", None)
+                if _current_cap is not None and _current_cap < _LORA_CAP_TARGET:
+                    try:
+                        iface.announce_cap = _LORA_CAP_TARGET
+                        log.info(
+                            "LoRa [%s] announce_cap patched: %.0f%% → %.0f%% "
+                            "(fixes I2P→LoRa announce forwarding; default 2%% causes "
+                            "12.8s gaps that exceed RNS rebroadcast window)",
+                            iname, (_current_cap * 100), (_LORA_CAP_TARGET * 100),
+                        )
+                    except Exception as _cap_err:
+                        log.debug("Could not patch announce_cap on %s: %s", iname, _cap_err)
 
     def _ensure_transport_enabled(self, rns_config_path):
         """Ensure the RNS config is correct before ``RNS.Reticulum()`` is called.
 
-        Two settings are enforced:
+        Three settings are enforced:
 
         ``enable_transport = Yes``
             Rathole is a transport node — it must route announces and serve
@@ -534,12 +582,24 @@ class RatholeDaemon:
             owns the RNodeInterface — rathole does not need to open the serial
             port directly.
 
-        Note: RNodeInterface mode is NOT enforced here.  The mode is
-        preserved as-is from the config file.  For I2P→LoRa bridging the
-        LoRa interface must be in ``full`` or ``gateway`` mode — ``access_point``
-        only re-propagates FROM LoRa TO other interfaces, not the reverse.
-        The ``_add_lora_interface()`` method defaults to ``full`` mode for
-        this reason.
+        ``RNodeInterface / RNodeMultiInterface mode = full`` (enforced)
+            RNS ``Transport.outbound()`` explicitly skips re-propagating
+            announces to any interface whose ``mode == MODE_ACCESS_POINT``
+            when ``attached_interface`` is None (i.e. normal announce
+            re-broadcast from the announce table).  This means that if the
+            LoRa interface is in ``access_point`` mode, announces arriving
+            from I2P or TCP will NEVER be forwarded to LoRa — the radio will
+            show TX traffic (rnsd heartbeats / path responses) but no new
+            announcements will ever reach LoRa devices.
+
+            ``access_point`` mode only re-propagates FROM LoRa clients TO
+            other interfaces, not the reverse.  ``full`` (or ``gateway``) is
+            required for bidirectional I2P↔LoRa bridging.
+
+            We enforce ``mode = full`` on every RNodeInterface /
+            RNodeMultiInterface section found in the config file so that
+            rnsd starts the radio in the correct mode on the next restart.
+            A WARNING is logged so the operator knows a restart is needed.
         """
         if rns_config_path:
             config_dir = Path(rns_config_path)
@@ -580,9 +640,80 @@ class RatholeDaemon:
                 log.info("share_instance set to Yes in %s (rathole uses shared rnsd instance)",
                          config_file)
 
-            # NOTE: RNodeInterface mode enforcement intentionally removed.
-            # Mode is preserved as-is from the config file to allow testing
-            # with mode = full (peer transport node mode).
+            # Enforce mode = full and announce_cap = 50 on all RNodeInterface /
+            # RNodeMultiInterface sections.
+            #
+            # ROOT CAUSE 1 — mode=access_point:
+            #   RNS Transport.outbound() explicitly skips re-propagating announces
+            #   to any interface in MODE_ACCESS_POINT when attached_interface is None
+            #   (normal announce re-broadcast path).  This means announces arriving
+            #   from I2P/TCP are NEVER forwarded to LoRa when the interface is in
+            #   access_point mode — the radio shows TX (rnsd heartbeats) but no new
+            #   announcements ever reach LoRa devices.
+            #   access_point mode only propagates FROM LoRa TO other interfaces.
+            #   full (or gateway) mode is required for bidirectional I2P↔LoRa bridging.
+            #
+            # ROOT CAUSE 2 — announce_cap too low (default 2%):
+            #   RNS default ANNOUNCE_CAP = 2% of interface bitrate.
+            #   LoRa at 6250 bps → cap = 125 bps → gap between announces = 12.8s.
+            #   RNS PATHFINDER_G rebroadcast grace window ≈ 11s.
+            #   Result: most I2P announces miss the rebroadcast window and are
+            #   silently dropped — the LoRa device never receives them.
+            #   Setting announce_cap = 50 (50%) reduces the gap to ~0.5s, ensuring
+            #   all queued announces are forwarded within the rebroadcast window.
+            #
+            # announce_cap in the RNS config is a percentage (0-100).
+            # RNS reads it as: announce_cap = config_value / 100.0
+            LORA_ANNOUNCE_CAP = 50  # 50% — allows ~1 announce per 0.5s at 6250 bps
+            ifaces_section = cfg.get("interfaces", {})
+            lora_mode_fixed = []
+            lora_cap_fixed = []
+            for iface_name, iface_cfg in ifaces_section.items():
+                if not isinstance(iface_cfg, dict):
+                    continue
+                itype = str(iface_cfg.get("type", "")).strip()
+                if itype not in ("RNodeInterface", "RNodeMultiInterface"):
+                    continue
+                imode = str(iface_cfg.get("mode", "")).strip().lower()
+                if imode in ("access_point", "roaming", ""):
+                    # access_point and roaming both block outbound announce re-propagation.
+                    # Empty mode defaults to access_point in RNS for RNodeInterface.
+                    ifaces_section[iface_name]["mode"] = "full"
+                    changed = True
+                    lora_mode_fixed.append(iface_name)
+                # Enforce announce_cap if not set or below our minimum
+                current_cap_str = iface_cfg.get("announce_cap", None)
+                if current_cap_str is None:
+                    ifaces_section[iface_name]["announce_cap"] = str(LORA_ANNOUNCE_CAP)
+                    changed = True
+                    lora_cap_fixed.append(iface_name)
+                else:
+                    try:
+                        current_cap = float(current_cap_str)
+                        if current_cap < LORA_ANNOUNCE_CAP:
+                            ifaces_section[iface_name]["announce_cap"] = str(LORA_ANNOUNCE_CAP)
+                            changed = True
+                            lora_cap_fixed.append(iface_name)
+                    except (ValueError, TypeError):
+                        pass
+            if lora_mode_fixed:
+                log.warning(
+                    "FIXED: RNodeInterface(s) %s had mode=access_point/roaming — "
+                    "changed to mode=full in %s. "
+                    "RESTART rnsd for the change to take effect. "
+                    "Without this fix, announces from I2P/TCP are NEVER forwarded to LoRa "
+                    "(RNS Transport.outbound() blocks announces on access_point interfaces).",
+                    lora_mode_fixed, config_file,
+                )
+            if lora_cap_fixed:
+                log.info(
+                    "FIXED: RNodeInterface(s) %s had announce_cap < %d%% — "
+                    "set to %d%% in %s. "
+                    "RESTART rnsd for the change to take effect. "
+                    "Default 2%% cap causes 12.8s gaps between LoRa announces, "
+                    "causing most I2P announces to miss the rebroadcast window.",
+                    lora_cap_fixed, LORA_ANNOUNCE_CAP, LORA_ANNOUNCE_CAP, config_file,
+                )
 
             if changed:
                 cfg.write()
@@ -640,8 +771,129 @@ class RatholeDaemon:
                         changed = True
                         log.info("share_instance set to Yes in %s", config_file)
 
-                # NOTE: RNodeInterface mode enforcement intentionally removed.
-                # Mode is preserved as-is from the config file.
+                # Enforce mode = full and announce_cap = 50 on RNodeInterface /
+                # RNodeMultiInterface sections.
+                # Text-based fallback: scan for [[SectionName]] blocks whose type is
+                # RNodeInterface or RNodeMultiInterface and fix mode + announce_cap.
+                #
+                # ROOT CAUSE 1: RNS Transport.outbound() blocks announce re-propagation
+                # to any interface in MODE_ACCESS_POINT (attached_interface=None path).
+                # ROOT CAUSE 2: Default announce_cap=2% causes 12.8s gaps between LoRa
+                # announces, causing most I2P announces to miss the rebroadcast window.
+                _LORA_ANNOUNCE_CAP_TEXT = 50  # 50% — see configobj path for full comment
+                in_rnode_section = False
+                lora_mode_fixed_text = []
+                lora_cap_fixed_text = []
+                current_section_name = ""
+                # Track which RNode sections have announce_cap set
+                rnode_sections_with_cap: set = set()
+                # Two-pass: first collect which sections already have announce_cap
+                _cur_sec = ""
+                _in_rnode = False
+                for line in lines:
+                    stripped = line.strip()
+                    if stripped.startswith("[[") and stripped.endswith("]]"):
+                        _cur_sec = stripped[2:-2].strip()
+                        _in_rnode = False
+                    elif stripped.startswith("[") and not stripped.startswith("[["):
+                        _in_rnode = False
+                        _cur_sec = ""
+                    elif stripped.lower().startswith("type") and "=" in stripped:
+                        val = stripped.split("=", 1)[1].strip().lower()
+                        if val in ("rnodeinterface", "rnodemultiinterface"):
+                            _in_rnode = True
+                    elif _in_rnode and stripped.lower().startswith("announce_cap") and "=" in stripped:
+                        rnode_sections_with_cap.add(_cur_sec)
+
+                new_lines = []
+                i = 0
+                while i < len(lines):
+                    line = lines[i]
+                    stripped = line.strip()
+                    # Detect subsection header [[Name]]
+                    if stripped.startswith("[[") and stripped.endswith("]]"):
+                        # Before moving to next section, inject announce_cap if missing
+                        if in_rnode_section and current_section_name not in rnode_sections_with_cap:
+                            indent = "    "
+                            new_lines.append(f"{indent}announce_cap = {_LORA_ANNOUNCE_CAP_TEXT}\n")
+                            lora_cap_fixed_text.append(current_section_name)
+                            changed = True
+                        current_section_name = stripped[2:-2].strip()
+                        in_rnode_section = False
+                        new_lines.append(line)
+                        i += 1
+                        continue
+                    # Detect top-level section [Name] — reset rnode tracking
+                    if stripped.startswith("[") and not stripped.startswith("[["):
+                        if in_rnode_section and current_section_name not in rnode_sections_with_cap:
+                            indent = "    "
+                            new_lines.append(f"{indent}announce_cap = {_LORA_ANNOUNCE_CAP_TEXT}\n")
+                            lora_cap_fixed_text.append(current_section_name)
+                            changed = True
+                        in_rnode_section = False
+                        current_section_name = ""
+                        new_lines.append(line)
+                        i += 1
+                        continue
+                    # Detect type = RNodeInterface inside a subsection
+                    if stripped.lower().startswith("type") and "=" in stripped:
+                        val = stripped.split("=", 1)[1].strip().lower()
+                        if val in ("rnodeinterface", "rnodemultiinterface"):
+                            in_rnode_section = True
+                        new_lines.append(line)
+                        i += 1
+                        continue
+                    # Fix mode = access_point or mode = roaming inside an RNode section
+                    if in_rnode_section and stripped.lower().startswith("mode") and "=" in stripped:
+                        val = stripped.split("=", 1)[1].strip().lower()
+                        if val in ("access_point", "roaming", ""):
+                            indent = line[: len(line) - len(line.lstrip())]
+                            new_lines.append(f"{indent}mode = full\n")
+                            lora_mode_fixed_text.append(current_section_name)
+                            changed = True
+                            i += 1
+                            continue
+                    # Fix announce_cap < 50 inside an RNode section
+                    if in_rnode_section and stripped.lower().startswith("announce_cap") and "=" in stripped:
+                        try:
+                            cap_val = float(stripped.split("=", 1)[1].strip())
+                            if cap_val < _LORA_ANNOUNCE_CAP_TEXT:
+                                indent = line[: len(line) - len(line.lstrip())]
+                                new_lines.append(f"{indent}announce_cap = {_LORA_ANNOUNCE_CAP_TEXT}\n")
+                                lora_cap_fixed_text.append(current_section_name)
+                                changed = True
+                                i += 1
+                                continue
+                        except (ValueError, TypeError):
+                            pass
+                    new_lines.append(line)
+                    i += 1
+                # Handle last section if it's an RNode section without announce_cap
+                if in_rnode_section and current_section_name not in rnode_sections_with_cap:
+                    indent = "    "
+                    new_lines.append(f"{indent}announce_cap = {_LORA_ANNOUNCE_CAP_TEXT}\n")
+                    lora_cap_fixed_text.append(current_section_name)
+                    changed = True
+
+                if lora_mode_fixed_text or lora_cap_fixed_text:
+                    lines = [l.rstrip("\n") for l in new_lines]
+                if lora_mode_fixed_text:
+                    log.warning(
+                        "FIXED: RNodeInterface(s) %s had mode=access_point/roaming — "
+                        "changed to mode=full in %s. "
+                        "RESTART rnsd for the change to take effect. "
+                        "Without this fix, announces from I2P/TCP are NEVER forwarded to LoRa.",
+                        lora_mode_fixed_text, config_file,
+                    )
+                if lora_cap_fixed_text:
+                    log.info(
+                        "FIXED: RNodeInterface(s) %s had announce_cap < %d%% — "
+                        "set to %d%% in %s. "
+                        "RESTART rnsd for the change to take effect. "
+                        "Default 2%% cap causes 12.8s gaps between LoRa announces.",
+                        lora_cap_fixed_text, _LORA_ANNOUNCE_CAP_TEXT,
+                        _LORA_ANNOUNCE_CAP_TEXT, config_file,
+                    )
 
                 if changed:
                     config_file.write_text("\n".join(lines) + "\n")
@@ -2365,12 +2617,19 @@ class RatholeDaemon:
             # We must set OUT, mode, announce_rate_target, and call
             # Transport.add_interface() directly so the LoRa interface is
             # properly registered and announces are forwarded to it.
+            # announce_cap for LoRa: use 50% instead of the RNS default 2%.
+            # At 2% and 6250 bps, the gap between announces is 12.8s which exceeds
+            # RNS's PATHFINDER_G rebroadcast grace window (~11s), causing most I2P
+            # announces to be silently dropped before reaching LoRa clients.
+            # 50% reduces the gap to ~0.5s, ensuring all queued announces are forwarded.
+            _LORA_ANNOUNCE_CAP_RUNTIME = 50.0 / 100.0  # 50%
+
             is_shared = getattr(self._rns_instance, "is_connected_to_shared_instance", False)
             if is_shared:
                 interface.OUT  = True
                 interface.IN   = True
                 interface.mode = interface_mode
-                interface.announce_cap          = RNS.Reticulum.ANNOUNCE_CAP / 100.0
+                interface.announce_cap          = _LORA_ANNOUNCE_CAP_RUNTIME
                 interface.announce_rate_target  = None
                 interface.announce_rate_grace   = None
                 interface.announce_rate_penalty = None
@@ -2386,10 +2645,16 @@ class RatholeDaemon:
                     log.debug("LoRa final_init (shared client): %s", _fi_err)
             else:
                 self._rns_instance._add_interface(interface, mode=interface_mode)
+                # Override announce_cap after _add_interface sets it from config default.
+                # _add_interface reads announce_cap from the RNS config file; if the config
+                # was just written by _ensure_transport_enabled it will already be 50%.
+                # Set it directly on the live object as belt-and-suspenders.
+                interface.announce_cap = _LORA_ANNOUNCE_CAP_RUNTIME
 
             log.info(
-                "Added LoRa interface: %s (mode=%s, freq=%d Hz, SF%d, BW=%d Hz, %d dBm)",
+                "Added LoRa interface: %s (mode=%s, freq=%d Hz, SF%d, BW=%d Hz, %d dBm, announce_cap=%.0f%%)",
                 name, mode, frequency, spreading_factor, bandwidth, txpower,
+                _LORA_ANNOUNCE_CAP_RUNTIME * 100,
             )
 
             self._persist_lora_interface(name, port, frequency, bandwidth, txpower, spreading_factor, coding_rate, mode=mode)
