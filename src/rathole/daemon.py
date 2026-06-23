@@ -444,15 +444,40 @@ class RatholeDaemon:
         if hasattr(RNS.Transport, "identity") and RNS.Transport.identity:
             log.info("Transport identity: %s", RNS.Transport.identity.hexhash)
 
-        # Log active interfaces
+        # Log active interfaces and detect duplicate I2P peers.
+        # rnsd names I2P peer interfaces "I2P Peer <b32[:8]> to <full_b32>"
+        # while rathole uses "I2P Peer <b32[:8]>".  If both appear in
+        # Transport.interfaces, the short-name one was added by rathole as a
+        # shared-instance client with OUT=False and no mode — it will NOT
+        # forward announces.  Log a warning so the operator can diagnose.
         iface_names = []
+        i2p_peer_short_names: set[str] = set()
+        i2p_peer_long_names:  set[str] = set()
         if hasattr(RNS.Transport, "interfaces"):
             for iface in RNS.Transport.interfaces:
                 name = getattr(iface, "name", None) or str(type(iface).__name__)
                 iface_names.append(name)
+                if "I2P" in type(iface).__name__ and not getattr(iface, "connectable", False):
+                    # Long name: "I2P Peer xxxxxxxx to xxxxxxxx…b32.i2p"
+                    if " to " in name:
+                        i2p_peer_long_names.add(name)
+                    else:
+                        i2p_peer_short_names.add(name)
         log.info("Interfaces active: %d%s",
                  len(iface_names),
                  f" ({', '.join(iface_names)})" if iface_names else "")
+
+        # Warn about duplicate I2P peer interfaces (short + long name for same peer)
+        for short in i2p_peer_short_names:
+            for long in i2p_peer_long_names:
+                if long.startswith(short + " to "):
+                    log.warning(
+                        "Duplicate I2P peer interface detected: '%s' (rathole-added, OUT=False) "
+                        "and '%s' (rnsd-managed, OUT=True). The short-name interface was added "
+                        "by rathole as a shared-instance client and is non-functional. "
+                        "Remove it via 'rat network remove i2p-peer %s' and restart.",
+                        short, long, short,
+                    )
 
         # ── Log LoRa interface details at startup ─────────────────────
         # Prints mode, frequency, SF, BW, and online status for every
@@ -1460,7 +1485,31 @@ class RatholeDaemon:
 
             config = {"name": name, "target_host": host, "target_port": str(port)}
             interface = TCPClientInterface(RNS.Transport, config)
-            self._rns_instance._add_interface(interface)
+
+            # Shared-instance client: _add_interface() is a no-op — init manually.
+            is_shared = getattr(self._rns_instance, "is_connected_to_shared_instance", False)
+            if is_shared:
+                from RNS.Interfaces.Interface import Interface as _RNSIface
+                interface.OUT  = True
+                interface.IN   = True
+                interface.mode = _RNSIface.MODE_FULL
+                interface.announce_cap          = RNS.Reticulum.ANNOUNCE_CAP / 100.0
+                interface.announce_rate_target  = None
+                interface.announce_rate_grace   = None
+                interface.announce_rate_penalty = None
+                interface.ifac_size = getattr(interface, "DEFAULT_IFAC_SIZE", 8)
+                if not hasattr(interface, "ifac_netname"):
+                    interface.ifac_netname = None
+                if not hasattr(interface, "ifac_netkey"):
+                    interface.ifac_netkey = None
+                RNS.Transport.add_interface(interface)
+                try:
+                    interface.final_init()
+                except Exception as _fi_err:
+                    log.debug("TCP client final_init (shared client): %s", _fi_err)
+            else:
+                self._rns_instance._add_interface(interface)
+
             log.info("Added TCP client interface: %s:%d", host, port)
 
             # Track with "new" flag so TUI shows "Connecting" on first add
@@ -1633,7 +1682,31 @@ class RatholeDaemon:
 
             config = {"name": name, "listen_ip": listen_ip, "listen_port": str(port)}
             interface = TCPServerInterface(RNS.Transport, config)
-            self._rns_instance._add_interface(interface)
+
+            # Shared-instance client: _add_interface() is a no-op — init manually.
+            is_shared = getattr(self._rns_instance, "is_connected_to_shared_instance", False)
+            if is_shared:
+                from RNS.Interfaces.Interface import Interface as _RNSIface
+                interface.OUT  = True
+                interface.IN   = True
+                interface.mode = _RNSIface.MODE_FULL
+                interface.announce_cap          = RNS.Reticulum.ANNOUNCE_CAP / 100.0
+                interface.announce_rate_target  = None
+                interface.announce_rate_grace   = None
+                interface.announce_rate_penalty = None
+                interface.ifac_size = getattr(interface, "DEFAULT_IFAC_SIZE", 8)
+                if not hasattr(interface, "ifac_netname"):
+                    interface.ifac_netname = None
+                if not hasattr(interface, "ifac_netkey"):
+                    interface.ifac_netkey = None
+                RNS.Transport.add_interface(interface)
+                try:
+                    interface.final_init()
+                except Exception as _fi_err:
+                    log.debug("TCP server final_init (shared client): %s", _fi_err)
+            else:
+                self._rns_instance._add_interface(interface)
+
             log.info("Added TCP server interface: %s:%d", listen_ip, port)
 
             # Track with "new" flag so TUI shows "Activating" on first add
@@ -1817,7 +1890,31 @@ class RatholeDaemon:
                 "connectable": True,
             }
             interface = RNS_I2PInterface(RNS.Transport, config)
-            self._rns_instance._add_interface(interface)
+
+            # Shared-instance client: _add_interface() is a no-op — init manually.
+            is_shared = getattr(self._rns_instance, "is_connected_to_shared_instance", False)
+            if is_shared:
+                from RNS.Interfaces.Interface import Interface as _RNSIface
+                interface.OUT  = True
+                interface.IN   = True
+                interface.mode = _RNSIface.MODE_FULL
+                interface.announce_cap          = RNS.Reticulum.ANNOUNCE_CAP / 100.0
+                interface.announce_rate_target  = None
+                interface.announce_rate_grace   = None
+                interface.announce_rate_penalty = None
+                interface.ifac_size = getattr(interface, "DEFAULT_IFAC_SIZE", 8)
+                if not hasattr(interface, "ifac_netname"):
+                    interface.ifac_netname = None
+                if not hasattr(interface, "ifac_netkey"):
+                    interface.ifac_netkey = None
+                RNS.Transport.add_interface(interface)
+                try:
+                    interface.final_init()
+                except Exception as _fi_err:
+                    log.debug("I2P server final_init (shared client): %s", _fi_err)
+            else:
+                self._rns_instance._add_interface(interface)
+
             self._i2p_interfaces.append(interface)
             log.info("Added I2P server interface: %s", name)
 
@@ -1925,6 +2022,14 @@ class RatholeDaemon:
 
         The status (Checking/Connected) is determined at runtime by the
         status command scanning RNS.Transport.interfaces every 5 seconds.
+
+        IMPORTANT: rnsd names I2P peer interfaces with the long form
+        "I2P Peer <b32[:8]> to <full_b32>" while rathole uses the short
+        form "I2P Peer <b32[:8]>".  We store the SHORT name in _i2p_peers
+        (used for TUI display and duplicate detection in _add_i2p_peer_interface).
+        The duplicate check in _add_i2p_peer_interface matches both forms via
+        prefix matching (iface_name.startswith(name + " ")), so storing the
+        short name here is correct and prevents double-add on restart.
         """
         try:
             from .i2p import list_rns_i2p_peers
@@ -1935,16 +2040,22 @@ class RatholeDaemon:
                 config_file = _default_rns_dir() / "config"
 
             existing_names = {p.get("name", "") for p in self._i2p_peers}
+            # Also collect existing B32 addresses to prevent duplicate-by-address
+            existing_b32s = {p.get("b32", "") for p in self._i2p_peers}
             count = 0
             for entry in list_rns_i2p_peers(config_file):
                 b32 = entry.get("b32", "").strip()
                 if not b32:
+                    continue
+                # Skip if already tracked by B32 address (catches naming variations)
+                if b32 in existing_b32s:
                     continue
                 short_name = f"I2P Peer {b32[:8]}"
                 if short_name in existing_names:
                     continue
                 self._i2p_peers.append({"name": short_name, "b32": b32})
                 existing_names.add(short_name)
+                existing_b32s.add(b32)
                 count += 1
                 log.info("Loaded I2P peer from config at startup: %s (%s)", short_name, b32[:16])
             if count:
@@ -1987,6 +2098,13 @@ class RatholeDaemon:
             # by checking our own _i2p_peers tracking list: if the name is
             # NOT in our tracking, the interface was already removed by us
             # and is just a stale Down object — skip it.
+            #
+            # IMPORTANT: rnsd names I2P peer interfaces with the long form
+            # "I2P Peer <b32[:8]> to <full_b32>" while rathole uses the
+            # short form "I2P Peer <b32[:8]>".  The _sync_i2p_peers_from_transport
+            # backfill stores the short name in _i2p_peers, so the tracked_names
+            # set contains the short name.  The duplicate check must match BOTH
+            # forms to prevent adding a second interface for the same peer.
             tracked_names = {p.get("name", "") for p in self._i2p_peers}
             for iface in RNS.Transport.interfaces:
                 iface_name = getattr(iface, "name", "") or ""
@@ -2016,7 +2134,39 @@ class RatholeDaemon:
                 "connectable": False,
             }
             interface = RNS_I2PInterface(RNS.Transport, config)
-            self._rns_instance._add_interface(interface)
+
+            # When rathole runs as a shared-instance client,
+            # _add_interface() skips ALL initialization (OUT, mode,
+            # announce_rate_target, Transport.add_interface) because
+            # is_connected_to_shared_instance=True.  We must set the
+            # required attributes manually so the interface is properly
+            # registered and announces flow through it.
+            is_shared = getattr(self._rns_instance, "is_connected_to_shared_instance", False)
+            if is_shared:
+                from RNS.Interfaces.Interface import Interface as _RNSIface
+                interface.OUT  = True
+                interface.IN   = True
+                interface.mode = _RNSIface.MODE_FULL
+                interface.announce_cap          = RNS.Reticulum.ANNOUNCE_CAP / 100.0
+                interface.announce_rate_target  = None
+                interface.announce_rate_grace   = None
+                interface.announce_rate_penalty = None
+                interface.ifac_size = getattr(interface, "DEFAULT_IFAC_SIZE", 8)
+                if not hasattr(interface, "ifac_netname"):
+                    interface.ifac_netname = None
+                if not hasattr(interface, "ifac_netkey"):
+                    interface.ifac_netkey = None
+                RNS.Transport.add_interface(interface)
+                try:
+                    interface.final_init()
+                except Exception as _fi_err:
+                    log.debug("I2P peer final_init (shared client): %s", _fi_err)
+                log.info(
+                    "Added I2P peer (shared-instance manual init): %s", b32_address[:16]
+                )
+            else:
+                self._rns_instance._add_interface(interface)
+
             self._i2p_interfaces.append(interface)
             # Mark as "new" so the TUI shows "Connecting" (first-time tunnel
             # establishment) rather than "Checking…" (status poll after reconnect).
@@ -2210,7 +2360,33 @@ class RatholeDaemon:
                 "enabled": "yes",
             }
             interface = RNodeInterface(RNS.Transport, config)
-            self._rns_instance._add_interface(interface, mode=interface_mode)
+
+            # Shared-instance client: _add_interface() is a no-op — init manually.
+            # We must set OUT, mode, announce_rate_target, and call
+            # Transport.add_interface() directly so the LoRa interface is
+            # properly registered and announces are forwarded to it.
+            is_shared = getattr(self._rns_instance, "is_connected_to_shared_instance", False)
+            if is_shared:
+                interface.OUT  = True
+                interface.IN   = True
+                interface.mode = interface_mode
+                interface.announce_cap          = RNS.Reticulum.ANNOUNCE_CAP / 100.0
+                interface.announce_rate_target  = None
+                interface.announce_rate_grace   = None
+                interface.announce_rate_penalty = None
+                interface.ifac_size = getattr(interface, "DEFAULT_IFAC_SIZE", 8)
+                if not hasattr(interface, "ifac_netname"):
+                    interface.ifac_netname = None
+                if not hasattr(interface, "ifac_netkey"):
+                    interface.ifac_netkey = None
+                RNS.Transport.add_interface(interface)
+                try:
+                    interface.final_init()
+                except Exception as _fi_err:
+                    log.debug("LoRa final_init (shared client): %s", _fi_err)
+            else:
+                self._rns_instance._add_interface(interface, mode=interface_mode)
+
             log.info(
                 "Added LoRa interface: %s (mode=%s, freq=%d Hz, SF%d, BW=%d Hz, %d dBm)",
                 name, mode, frequency, spreading_factor, bandwidth, txpower,

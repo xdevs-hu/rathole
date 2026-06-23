@@ -225,15 +225,26 @@ def _hooked_inbound(raw, receiving_interface):
     try:
         ctx = _extract_context_from_raw(raw, receiving_interface)
 
-        # ── LoRa announce receipt — always log at INFO ────────────────
-        # This is the single most important visibility point: if a LoRa
-        # client sends an announce and the station receives it, this line
-        # MUST appear in the log.  If it doesn't, the radio is not
-        # delivering packets to Transport.inbound() at all (hardware,
-        # config, or mode issue — not a Rathole issue).
+        # ── Interface-specific announce logging ───────────────────────
+        # Log ALL announce receipts at DEBUG, and LoRa/I2P at INFO so
+        # operators can confirm packets are reaching Transport.inbound().
+        #
+        # LoRa: "LoRa ANNOUNCE received" — confirms radio delivery.
+        #   If absent, the radio is not delivering to Transport.inbound()
+        #   (hardware, config, or mode issue — not a Rathole issue).
+        #
+        # I2P: "I2P ANNOUNCE received" — confirms I2P→LoRa bridging path.
+        #   If absent but I2P shows traffic, the hook is not seeing I2P
+        #   packets (shared-instance routing issue).
+        #   If present but LoRa shows no TX, RNS is dropping during
+        #   re-propagation (mode, OUT flag, or announce_cap issue).
         if ctx.is_announce and receiving_interface is not None:
             _itype = type(receiving_interface).__name__
-            if "RNode" in _itype or "LoRa" in _itype or ctx.snr is not None or ctx.rssi is not None:
+            _iname = ctx.interface_name or _itype
+            _is_lora = "RNode" in _itype or "LoRa" in _itype or ctx.snr is not None or ctx.rssi is not None
+            _is_i2p  = "I2P" in _itype or "i2p" in _iname.lower()
+
+            if _is_lora:
                 _rssi = ctx.rssi
                 _snr  = ctx.snr
                 _radio = (
@@ -248,13 +259,42 @@ def _hooked_inbound(raw, receiving_interface):
                     ctx.hop_count,
                     ctx.raw_size,
                     _radio,
-                    ctx.interface_name or type(receiving_interface).__name__,
+                    _iname,
+                )
+            elif _is_i2p:
+                log.info(
+                    "I2P ANNOUNCE received: dest=%s hops=%d size=%d via [%s]",
+                    ctx.destination_hash[:16] if ctx.destination_hash else "?",
+                    ctx.hop_count,
+                    ctx.raw_size,
+                    _iname,
+                )
+            else:
+                log.debug(
+                    "ANNOUNCE received: dest=%s hops=%d size=%d via [%s]",
+                    ctx.destination_hash[:16] if ctx.destination_hash else "?",
+                    ctx.hop_count,
+                    ctx.raw_size,
+                    _iname,
                 )
 
         verdict = _router.evaluate(ctx)
 
         if verdict.dropped:
-            log.debug("Blocked %s from %s: %s", ctx.type_name, ctx.interface_name, verdict)
+            # Log I2P drops at INFO (not just DEBUG) so bridging failures
+            # are visible without enabling DEBUG logging globally.
+            _iname = ctx.interface_name or ""
+            _is_i2p = "I2P" in _iname or "i2p" in _iname.lower()
+            if _is_i2p and ctx.is_announce:
+                log.info(
+                    "I2P ANNOUNCE DROPPED by filter '%s': dest=%s hops=%d reason=%s",
+                    verdict.filter_name,
+                    ctx.destination_hash[:16] if ctx.destination_hash else "?",
+                    ctx.hop_count,
+                    verdict.reason or str(verdict),
+                )
+            else:
+                log.debug("Blocked %s from %s: %s", ctx.type_name, ctx.interface_name, verdict)
             return
 
         # Ensure interface has announce_rate_target before RNS accesses it.
