@@ -87,6 +87,16 @@ burst = 50
 # Action when rate exceeded: "drop" or "throttle"
 overflow_action = "drop"
 
+# Exempt I2P interfaces from the per-interface packet rate limit.
+#
+# I2P traffic is already rate-limited by i2pd and the SAM protocol at
+# the tunnel layer.  Applying a single coarse token bucket across all
+# I2P peers causes the bucket to exhaust under normal load and drops
+# packets before they can be forwarded to LoRa (breaking I2P→LoRa
+# bridging).  Set to false only if you need explicit I2P ingress caps
+# on a high-traffic public gateway.
+exempt_i2p = true
+
 
 # ─── G2. Bandwidth Cap ────────────────────────────────────────
 #
@@ -107,12 +117,23 @@ burst_bytes = 1_000_000
 #
 # Drops any packet exceeding a maximum size. Reticulum's MTU is
 # 500 bytes for single packets; this provides a safety margin.
+#
+# By default this filter only applies to LoRa inbound packets.
+# I2P and TCP packets may legitimately exceed 500 bytes due to SAM
+# framing and tunnel overhead; RNS handles fragmentation before
+# forwarding to LoRa, so dropping them here breaks I2P→LoRa bridging.
 
 [filters.packet_size]
 enabled = true
 
 # Maximum packet size in bytes. Packets larger than this are dropped.
 max_bytes = 600
+
+# Only enforce the size cap on LoRa inbound packets (default: true).
+# Set to false to enforce globally on all interface types.
+# WARNING: setting false will drop oversized I2P packets before they
+# can be forwarded to LoRa, breaking I2P→LoRa bridging.
+lora_only = true
 
 
 # ═══════════════════════════════════════════════════════════════════

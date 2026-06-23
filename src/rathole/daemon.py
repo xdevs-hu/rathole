@@ -492,7 +492,7 @@ class RatholeDaemon:
     def _ensure_transport_enabled(self, rns_config_path):
         """Ensure the RNS config is correct before ``RNS.Reticulum()`` is called.
 
-        Three settings are enforced:
+        Two settings are enforced:
 
         ``enable_transport = Yes``
             Rathole is a transport node — it must route announces and serve
@@ -509,12 +509,12 @@ class RatholeDaemon:
             owns the RNodeInterface — rathole does not need to open the serial
             port directly.
 
-        ``RNodeInterface mode = access_point``
-            In ``access_point`` mode the RNode acts as a LoRa access point /
-            gateway — clients connect to it.  ``full`` mode is for peer
-            transport nodes that also relay traffic between other nodes.
-            Rathole operates as an access point, so ``access_point`` is the
-            correct mode.
+        Note: RNodeInterface mode is NOT enforced here.  The mode is
+        preserved as-is from the config file.  For I2P→LoRa bridging the
+        LoRa interface must be in ``full`` or ``gateway`` mode — ``access_point``
+        only re-propagates FROM LoRa TO other interfaces, not the reverse.
+        The ``_add_lora_interface()`` method defaults to ``full`` mode for
+        this reason.
         """
         if rns_config_path:
             config_dir = Path(rns_config_path)
@@ -2191,7 +2191,12 @@ class RatholeDaemon:
                 "boundary":       _RNSIface.MODE_BOUNDARY,         # 5
                 "point_to_point": _RNSIface.MODE_POINT_TO_POINT,   # 2
             }
-            interface_mode = _mode_map.get(mode.lower(), _RNSIface.MODE_ACCESS_POINT)
+            # Default to MODE_FULL so I2P→LoRa re-propagation works.
+            # MODE_ACCESS_POINT only re-propagates FROM LoRa clients TO other
+            # interfaces — it does NOT forward packets arriving from I2P/TCP
+            # back to LoRa.  MODE_FULL is the correct mode for a bridging
+            # transport node that needs bidirectional I2P↔LoRa forwarding.
+            interface_mode = _mode_map.get(mode.lower(), _RNSIface.MODE_FULL)
 
             config = {
                 "name": name,
