@@ -2088,7 +2088,7 @@ def cmd_network(args):
                 txpower=txpower,
                 spreadingfactor=sf,
                 codingrate=cr,
-                mode="access_point",
+                mode="full",
             )
 
             if not _check_rns_transport(rns_config):

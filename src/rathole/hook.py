@@ -186,6 +186,23 @@ def _extract_context_from_raw(raw: bytes, receiving_interface) -> PacketContext:
         if kwargs.get("packet_type") == PACKET_ANNOUNCE and kwargs.get("destination_hash"):
             kwargs["peer_hash"] = kwargs["destination_hash"]
 
+        # For LoRa (broadcast medium) interfaces, RNodeInterface has no
+        # remote_identity or meaningful hash, so peer_hash stays "unknown"
+        # for all non-ANNOUNCE packet types.  Fall back to destination_hash
+        # for ALL packet types on LoRa so that DATA/LINKREQUEST/PROOF
+        # packets are attributed to a peer and appear in the Peers tab.
+        # Without this, the LoRa interface shows traffic but zero peers.
+        if kwargs.get("peer_hash", "unknown") == "unknown" and kwargs.get("destination_hash"):
+            _iface_name = kwargs.get("interface_name", "")
+            _iface_obj  = receiving_interface
+            _is_lora_iface = (
+                is_lora_interface(_iface_obj)
+                if _iface_obj is not None
+                else ("RNode" in _iface_name or "LoRa" in _iface_name)
+            )
+            if _is_lora_iface:
+                kwargs["peer_hash"] = kwargs["destination_hash"]
+
     except Exception as e:
         log.error("Failed to parse raw packet header: %s", e)
 

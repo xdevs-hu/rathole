@@ -448,7 +448,7 @@ class RatholeDaemon:
         iface_names = []
         if hasattr(RNS.Transport, "interfaces"):
             for iface in RNS.Transport.interfaces:
-                name = getattr(iface, "name", str(type(iface).__name__))
+                name = getattr(iface, "name", None) or str(type(iface).__name__)
                 iface_names.append(name)
         log.info("Interfaces active: %d%s",
                  len(iface_names),
@@ -472,9 +472,9 @@ class RatholeDaemon:
                 cr      = getattr(iface, "cr", None)
                 txpwr   = getattr(iface, "txpower", None)
                 bitrate = getattr(iface, "bitrate", None)
-                _MODE_NAMES = {0: "full", 1: "gateway", 2: "client",
+                _MODE_NAMES = {1: "full", 2: "point_to_point",
                                3: "access_point", 4: "roaming",
-                               5: "boundary", 6: "point_to_point"}
+                               5: "boundary", 6: "gateway"}
                 mode_str = _MODE_NAMES.get(mode_v, f"mode_{mode_v}") if mode_v is not None else "?"
                 log.info(
                     "LoRa startup: [%s] online=%s mode=%s(%s) "
@@ -482,12 +482,10 @@ class RatholeDaemon:
                     iname, online, mode_str, mode_v,
                     freq, sf, bw, txpwr, bitrate,
                 )
-                # Warn explicitly if mode is full — access_point is the expected mode
+                # Log mode for visibility (full mode is intentional for testing)
                 if mode_v == 0:
-                    log.warning(
-                        "LoRa [%s] is in FULL mode — "
-                        "expected access_point mode for a LoRa access point. "
-                        "Check _ensure_transport_enabled() or set mode=access_point in RNS config.",
+                    log.info(
+                        "LoRa [%s] is in FULL mode (peer transport node).",
                         iname,
                     )
 
@@ -557,25 +555,9 @@ class RatholeDaemon:
                 log.info("share_instance set to Yes in %s (rathole uses shared rnsd instance)",
                          config_file)
 
-            # Enforce mode = access_point on all RNodeInterface sections.
-            # Rathole operates as a LoRa access point / gateway — clients
-            # connect to it.  If the config was previously set to "full"
-            # (peer transport node mode), correct it to "access_point".
-            ifaces_section = cfg.get("interfaces", {})
-            for iface_name, iface_cfg in ifaces_section.items():
-                if not isinstance(iface_cfg, dict):
-                    continue
-                if iface_cfg.get("type", "").strip() != "RNodeInterface":
-                    continue
-                current_mode = str(iface_cfg.get("mode", "")).strip().lower()
-                if current_mode == "full":
-                    cfg["interfaces"][iface_name]["mode"] = "access_point"
-                    changed = True
-                    log.info(
-                        "RNodeInterface '%s' mode changed full→access_point in %s "
-                        "(rathole operates as a LoRa access point)",
-                        iface_name, config_file,
-                    )
+            # NOTE: RNodeInterface mode enforcement intentionally removed.
+            # Mode is preserved as-is from the config file to allow testing
+            # with mode = full (peer transport node mode).
 
             if changed:
                 cfg.write()
@@ -633,30 +615,8 @@ class RatholeDaemon:
                         changed = True
                         log.info("share_instance set to Yes in %s", config_file)
 
-                # Fix RNodeInterface mode: full → access_point
-                # Single-pass: track whether we're inside an RNodeInterface
-                # section, then replace mode = full with mode = access_point.
-                new_lines = []
-                in_rnode = False
-                for line in lines:
-                    stripped = line.strip().lower()
-                    # New [[section]] resets context
-                    if stripped.startswith("[[") and stripped.endswith("]]"):
-                        in_rnode = False
-                    # Detect RNodeInterface type line
-                    if stripped.startswith("type") and "=" in stripped:
-                        val = stripped.split("=", 1)[1].strip()
-                        if val == "rnodeinterface":
-                            in_rnode = True
-                    # Fix mode inside an RNodeInterface section
-                    if in_rnode and stripped.startswith("mode") and "=" in stripped:
-                        val = stripped.split("=", 1)[1].strip()
-                        if val == "full":
-                            line = line.replace("full", "access_point")
-                            changed = True
-                            log.info("RNodeInterface mode full→access_point in %s", config_file)
-                    new_lines.append(line)
-                lines = new_lines
+                # NOTE: RNodeInterface mode enforcement intentionally removed.
+                # Mode is preserved as-is from the config file.
 
                 if changed:
                     config_file.write_text("\n".join(lines) + "\n")
@@ -1037,7 +997,7 @@ class RatholeDaemon:
                 _live_online: set[str] = set()   # online=True
                 _live_down: set[str] = set()     # present but online=False
                 for _iface in _RNS.Transport.interfaces:
-                    _iname = getattr(_iface, "name", "")
+                    _iname = getattr(_iface, "name", "") or ""
                     if "I2P" in type(_iface).__name__ and not getattr(_iface, "connectable", False):
                         if getattr(_iface, "online", True):
                             _live_online.add(_iname)
@@ -1082,7 +1042,7 @@ class RatholeDaemon:
                 _tcp_live_online: set[str] = set()
                 _tcp_live_down: set[str] = set()
                 for _iface in _RNS.Transport.interfaces:
-                    _iname = getattr(_iface, "name", "")
+                    _iname = getattr(_iface, "name", "") or ""
                     _itype = type(_iface).__name__
                     if "TCPClient" in _itype:
                         if getattr(_iface, "online", True):
@@ -1117,7 +1077,7 @@ class RatholeDaemon:
                 _srv_live_online: set[str] = set()
                 _srv_live_down: set[str] = set()
                 for _iface in _RNS.Transport.interfaces:
-                    _iname = getattr(_iface, "name", "")
+                    _iname = getattr(_iface, "name", "") or ""
                     _itype = type(_iface).__name__
                     if "TCPServer" in _itype:
                         if getattr(_iface, "online", True):
@@ -1395,7 +1355,7 @@ class RatholeDaemon:
                 return {"ok": False, "error": f"Invalid radio parameter: {e}"}
             if not (2 <= txpower <= 23):
                 return {"ok": False, "error": "txpower must be 2–23 dBm"}
-            mode = str(args.get("mode", "access_point")).strip() or "access_point"
+            mode = str(args.get("mode", "full")).strip() or "full"
             return self._add_lora_interface(port, frequency, bandwidth, txpower, sf, cr, mode=mode)
         elif cmd == "remove_lora_interface":
             name = args.get("name", "").strip()
@@ -2029,7 +1989,7 @@ class RatholeDaemon:
             # and is just a stale Down object — skip it.
             tracked_names = {p.get("name", "") for p in self._i2p_peers}
             for iface in RNS.Transport.interfaces:
-                iface_name = getattr(iface, "name", "")
+                iface_name = getattr(iface, "name", "") or ""
                 iface_peers = getattr(iface, "peers", None) or ""
                 # Match short name, long name (prefix), or B32 address
                 name_match = (
@@ -2189,13 +2149,13 @@ class RatholeDaemon:
         txpower: int = 17,
         spreading_factor: int = 8,
         coding_rate: int = 5,
-        mode: str = "access_point",
+        mode: str = "full",
     ) -> dict:
         """Add an RNodeInterface (LoRa) at runtime.
 
         Args:
-            mode: RNS interface mode written to the config — ``"access_point"``
-                  (default) or ``"full"``.
+            mode: RNS interface mode written to the config — ``"full"``
+                  (default, peer transport node) or ``"access_point"``.
         """
         try:
             import RNS
@@ -2363,7 +2323,7 @@ class RatholeDaemon:
         txpower: int,
         spreading_factor: int,
         coding_rate: int,
-        mode: str = "access_point",
+        mode: str = "full",
     ):
         """Write the RNodeInterface to the RNS config file for persistence."""
         try:

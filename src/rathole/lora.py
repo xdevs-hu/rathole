@@ -218,10 +218,18 @@ def detect_lora_interfaces() -> list[dict[str, Any]]:
                 val = getattr(iface, attr, None)
                 if val is not None:
                     info[attr] = val
-            # Mode — RNS stores mode as an int (e.g. 3 = ACCESS_POINT).
-            # Convert to a human-readable string for the TUI.
+            # Mode — RNS stores mode as an int matching Interface.MODE_* constants:
+            #   MODE_FULL=1, MODE_POINT_TO_POINT=2, MODE_ACCESS_POINT=3,
+            #   MODE_ROAMING=4, MODE_BOUNDARY=5, MODE_GATEWAY=6
             _mode_raw = getattr(iface, "mode", None)
-            _MODE_NAMES = {0: "full", 1: "gateway", 2: "client", 3: "access_point"}
+            _MODE_NAMES = {
+                1: "full",
+                2: "point_to_point",
+                3: "access_point",
+                4: "roaming",
+                5: "boundary",
+                6: "gateway",
+            }
             if isinstance(_mode_raw, int):
                 info["mode"] = _MODE_NAMES.get(_mode_raw, f"mode_{_mode_raw}")
             elif _mode_raw:
@@ -295,7 +303,7 @@ def add_rns_rnode_interface(
     spreadingfactor: int = DEFAULT_RNODE_PARAMS["spreadingfactor"],
     codingrate: int = DEFAULT_RNODE_PARAMS["codingrate"],
     enabled: bool = True,
-    mode: str = "access_point",
+    mode: str = "full",
 ):
     """Write an RNodeInterface section to an RNS config file.
 

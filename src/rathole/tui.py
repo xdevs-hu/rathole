@@ -2937,8 +2937,8 @@ def _build_tui(sock_path: str, refresh_interval: float = 5.0,
                     self.notify("Coding rate must be 5–8 (4/5 through 4/8)", severity="error")
                     return
 
-                # mode is always access_point — RNode mode cannot be changed via rnodeconf at runtime
-                lora_mode = "access_point"
+                # mode = full for testing (peer transport node mode)
+                lora_mode = "full"
 
                 self.notify(f"Adding LoRa interface on {port}…", severity="information")
                 resp = self._send("add_lora_interface", {
