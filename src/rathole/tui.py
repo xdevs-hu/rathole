@@ -568,6 +568,12 @@ def _build_tui(sock_path: str, refresh_interval: float = 5.0,
             yield Vertical(id="tcp-servers-list")
             with Horizontal(id="i2p-add-form"):
                 yield Input(placeholder="I2P B32 address", id="i2p-b32-input")
+                yield Select(
+                    [("Full", "full"), ("Boundary", "boundary")],
+                    value="full",
+                    id="i2p-mode-select",
+                    allow_blank=False,
+                )
                 yield Button("Connect I2P", id="i2p-connect-btn", variant="success")
                 yield Button("Start I2P Server", id="i2p-server-btn", variant="primary")
             yield Vertical(id="i2p-peers-list")
@@ -2096,6 +2102,11 @@ def _build_tui(sock_path: str, refresh_interval: float = 5.0,
             where the full interface name is available.  The TUI uses those
             flags directly instead of doing its own RNS scan, which is
             unreliable in shared-instance mode.
+
+            The ``#i2p-mode-select`` widget is updated to reflect the mode of
+            the first outbound peer so the user sees the current mode when they
+            open the Interfaces tab.  When no peers exist the selector resets
+            to ``"full"`` so the next add starts with a clean default.
             """
             try:
                 container = self.query_one("#i2p-peers-list", Vertical)
@@ -2127,9 +2138,14 @@ def _build_tui(sock_path: str, refresh_interval: float = 5.0,
                 self_row.mount(self_label)
 
             # ── Outbound peer rows ────────────────────────────────
+            # The mode selector (#i2p-mode-select) is never touched by refresh —
+            # it stays at "full" by default and only changes when the user picks
+            # a value.  The mode of each existing peer is shown inline as
+            # "(Mode: Boundary)" or "(Mode: Full)", mirroring the LoRa style.
             for peer in peers:
                 name = peer.get("name", "")
                 b32 = peer.get("b32", "")
+                mode = peer.get("mode", "full") or "full"
                 # Use daemon-supplied flags (enriched in status command):
                 #   connected=True              → Status: Up  → Connected
                 #   connected=False, new=True   → first-time add, tunnel not yet up
@@ -2150,10 +2166,14 @@ def _build_tui(sock_path: str, refresh_interval: float = 5.0,
                 else:
                     bullet = "[bold yellow]●[/] [bold yellow]Connecting[/]"
 
+                # Inline mode label — mirrors LoRa "(Mode: Access Point)" style
+                mode_display = mode.replace("_", " ").title()
+                mode_label = f"  [dim](Mode: {mode_display})[/]"
+
                 safe_id = name.replace(" ", "_").replace(".", "_")
                 row = Horizontal(classes="i2p-peer-row")
                 label = Static(
-                    f"{bullet}  {b32}",
+                    f"{bullet}  {b32}{mode_label}",
                     classes="i2p-peer-label",
                 )
                 btn = Button(
@@ -2755,8 +2775,18 @@ def _build_tui(sock_path: str, refresh_interval: float = 5.0,
             except Exception as e:
                 self.notify(f"Error: {e}", severity="error")
 
-        @work(thread=True)
         def _handle_i2p_connect(self) -> None:
+            """Read widget values on the main thread, then dispatch the RPC worker.
+
+            Widget state (Input.value, Select.value) must be read from the main
+            Textual thread.  The previous implementation used @work(thread=True)
+            which caused Select.value to be read from a background thread, where
+            Textual may return a stale or default value — resulting in mode="full"
+            being sent even when the user had selected "Boundary".
+
+            Fix: snapshot b32 and mode on the main thread here, then pass them
+            as plain strings to the worker so no widget access happens off-thread.
+            """
             try:
                 b32_input = self.query_one("#i2p-b32-input", Input)
                 b32 = b32_input.value.strip()
@@ -2765,11 +2795,34 @@ def _build_tui(sock_path: str, refresh_interval: float = 5.0,
                     return
                 if not b32.endswith(".b32.i2p"):
                     b32 = b32 + ".b32.i2p"
-                resp = self._send("add_i2p_peer", {"b32": b32})
+                # Snapshot mode on the main thread — reading Select.value from a
+                # background worker is unsafe and returns stale/default values.
+                try:
+                    mode_select = self.query_one("#i2p-mode-select", Select)
+                    mode = str(mode_select.value) if mode_select.value else "full"
+                except Exception:
+                    mode = "full"
+                # Clear the input immediately (main thread)
+                b32_input.value = ""
+            except Exception as e:
+                self.notify(f"Error: {e}", severity="error")
+                return
+            # Dispatch the actual RPC call on a worker thread with the
+            # already-snapshotted values — no widget access in the worker.
+            self._handle_i2p_connect_worker(b32, mode)
+
+        @work(thread=True)
+        def _handle_i2p_connect_worker(self, b32: str, mode: str) -> None:
+            """Background worker: send add_i2p_peer RPC with pre-snapshotted values."""
+            try:
+                resp = self._send("add_i2p_peer", {"b32": b32, "mode": mode})
                 if resp.get("ok"):
                     name = resp.get("name", b32[:16])
-                    self.notify(f"I2P peer added: {name}", severity="information")
-                    self.call_from_thread(lambda: b32_input.__setattr__("value", ""))
+                    mode_label = "Boundary" if mode == "boundary" else "Full"
+                    self.notify(
+                        f"I2P peer added: {name} [{mode_label}]",
+                        severity="information",
+                    )
                     self.refresh_data()
                 else:
                     self.notify(f"Error: {resp.get('error', '?')}", severity="error")

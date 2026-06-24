@@ -729,9 +729,13 @@ class RatholeDaemon:
                 if itype not in ("RNodeInterface", "RNodeMultiInterface"):
                     continue
                 imode = str(iface_cfg.get("mode", "")).strip().lower()
+                # Only fix modes that block outbound announce re-propagation.
+                # access_point: only propagates FROM LoRa TO other interfaces.
+                # roaming: restricts outbound re-propagation.
+                # empty: RNS defaults to access_point for RNodeInterface.
+                # full, boundary, gateway, point_to_point: all allow bidirectional
+                # announce re-propagation — do NOT overwrite these.
                 if imode in ("access_point", "roaming", ""):
-                    # access_point and roaming both block outbound announce re-propagation.
-                    # Empty mode defaults to access_point in RNS for RNodeInterface.
                     ifaces_section[iface_name]["mode"] = "full"
                     changed = True
                     lora_mode_fixed.append(iface_name)
@@ -1704,7 +1708,10 @@ class RatholeDaemon:
             from .i2p import validate_b32_address
             if not validate_b32_address(b32):
                 return {"ok": False, "error": "Invalid B32 address (expected 52 base32 chars + .b32.i2p)"}
-            return self._add_i2p_peer_interface(b32)
+            mode = str(args.get("mode", "full")).strip().lower() or "full"
+            if mode not in ("full", "boundary"):
+                return {"ok": False, "error": "mode must be 'full' or 'boundary'"}
+            return self._add_i2p_peer_interface(b32, mode=mode)
         elif cmd == "remove_i2p_peer":
             name = args.get("name", "").strip()
             if not name:
@@ -2356,30 +2363,47 @@ class RatholeDaemon:
             existing_b32s = {p.get("b32", "") for p in self._i2p_peers}
             count = 0
 
-            # Pass 1: backfill from RNS config file sections (primary source)
-            for entry in list_rns_i2p_peers(config_file):
-                b32 = entry.get("b32", "").strip()
-                if not b32:
-                    continue
-                # Skip if already tracked by B32 address (catches naming variations)
-                if b32 in existing_b32s:
-                    continue
-                short_name = f"I2P Peer {b32[:8]}"
-                if short_name in existing_names:
-                    continue
-                self._i2p_peers.append({"name": short_name, "b32": b32})
-                existing_names.add(short_name)
-                existing_b32s.add(b32)
-                count += 1
-                log.info("Loaded I2P peer from config at startup: %s (%s)", short_name, b32[:16])
+            # Build a map of b32 → mode from the RNS config file so Pass 2
+            # can attach the persisted mode to live-transport entries.
+            # list_rns_i2p_peers() returns {"name", "b32", "mode"} where
+            # "b32" is the raw peers= value from the config section — it may
+            # be a comma-separated list (e.g. "addr1.b32.i2p, addr2.b32.i2p").
+            # We split on commas and strip each token so every individual B32
+            # address maps to the correct mode, regardless of how many peers
+            # are listed in a single section.
+            _config_mode_by_b32: dict[str, str] = {}
+            _config_entries = list_rns_i2p_peers(config_file)
+            for _ce in _config_entries:
+                _raw_b32 = _ce.get("b32", "")
+                _mode_val = _ce.get("mode", "full")
+                # Split comma-separated peer lists and register each address
+                for _token in _raw_b32.split(","):
+                    _cb32 = _token.strip()
+                    if _cb32:
+                        _config_mode_by_b32[_cb32] = _mode_val
 
-            # Pass 2: backfill from live Transport.interfaces for rnsd-managed
-            # long-name peer interfaces not covered by the config file scan.
-            # Long name format: "I2P Peer <b32[:8]> to <full_b32>"
-            # This catches peers that rnsd loaded from its own config sections
-            # with non-standard names or that were added outside of rathole.
+            # Pass 1: backfill from live Transport.interfaces (preferred source).
+            # rnsd-managed long-name interfaces ("I2P Peer <b32[:8]> to <full_b32>")
+            # are the authoritative live state.  We read them first so that Pass 2
+            # (config file) skips any B32 already covered here.
+            # Mode is taken from the persisted config (config_mode_by_b32) because
+            # the live interface object does not expose the mode string.
+            #
+            # IMPORTANT: rnsd's I2PInterface constructor ignores the "mode" key in
+            # the config dict — it always initialises the interface with MODE_FULL.
+            # We patch the mode on the live object here so that rnstatus and RNS
+            # Transport.outbound() both see the correct mode (e.g. MODE_BOUNDARY).
             try:
                 import RNS as _RNS
+                from RNS.Interfaces.Interface import Interface as _RNSIface
+                _startup_mode_map = {
+                    "full":           _RNSIface.MODE_FULL,
+                    "boundary":       _RNSIface.MODE_BOUNDARY,
+                    "gateway":        _RNSIface.MODE_GATEWAY,
+                    "access_point":   _RNSIface.MODE_ACCESS_POINT,
+                    "roaming":        _RNSIface.MODE_ROAMING,
+                    "point_to_point": _RNSIface.MODE_POINT_TO_POINT,
+                }
                 for _iface in _RNS.Transport.interfaces:
                     if "I2P" not in type(_iface).__name__:
                         continue
@@ -2392,21 +2416,60 @@ class RatholeDaemon:
                     _b32 = _iname.split(" to ", 1)[1].strip()
                     if not _b32:
                         continue
+                    _mode = _config_mode_by_b32.get(_b32, "full")
+                    # Patch the live interface object so rnstatus and Transport
+                    # both see the correct mode.  rnsd's I2PInterface constructor
+                    # ignores the "mode" config key and always sets MODE_FULL.
+                    _desired_mode_int = _startup_mode_map.get(_mode, _RNSIface.MODE_FULL)
+                    _current_mode_int = getattr(_iface, "mode", _RNSIface.MODE_FULL)
+                    if _current_mode_int != _desired_mode_int:
+                        try:
+                            _iface.mode = _desired_mode_int
+                            log.info(
+                                "Patched I2P peer interface '%s' mode: %s → %s",
+                                _iname, _current_mode_int, _mode,
+                            )
+                        except Exception as _patch_err:
+                            log.debug("Could not patch mode on %s: %s", _iname, _patch_err)
                     if _b32 in existing_b32s:
                         continue
                     _short = f"I2P Peer {_b32[:8]}"
                     if _short in existing_names:
                         continue
-                    self._i2p_peers.append({"name": _short, "b32": _b32})
+                    self._i2p_peers.append({"name": _short, "b32": _b32, "mode": _mode})
                     existing_names.add(_short)
                     existing_b32s.add(_b32)
                     count += 1
                     log.info(
-                        "Loaded I2P peer from live transport at startup: %s (%s)",
-                        _short, _b32[:16],
+                        "Loaded I2P peer from live transport at startup: %s (%s) mode=%s",
+                        _short, _b32[:16], _mode,
                     )
             except Exception as _te:
                 log.debug("Could not scan Transport.interfaces for I2P peers: %s", _te)
+
+            # Pass 2: backfill from RNS config file sections for any peers not
+            # already covered by the live transport scan above.  This handles
+            # peers that are persisted in the config but whose rnsd tunnel has
+            # not yet appeared in Transport.interfaces (e.g. slow SAM bootstrap).
+            for entry in _config_entries:
+                b32 = entry.get("b32", "").strip()
+                if not b32:
+                    continue
+                # Skip if already tracked by B32 address (live transport pass above)
+                if b32 in existing_b32s:
+                    continue
+                short_name = f"I2P Peer {b32[:8]}"
+                if short_name in existing_names:
+                    continue
+                mode_val = entry.get("mode", "full")
+                self._i2p_peers.append({"name": short_name, "b32": b32, "mode": mode_val})
+                existing_names.add(short_name)
+                existing_b32s.add(b32)
+                count += 1
+                log.info(
+                    "Loaded I2P peer from config at startup: %s (%s) mode=%s",
+                    short_name, b32[:16], mode_val,
+                )
 
             if count:
                 log.info("Backfilled %d I2P peer(s) from RNS config/transport", count)
@@ -2428,8 +2491,16 @@ class RatholeDaemon:
         except Exception as e:
             log.warning("Interface active but failed to persist to config: %s", e)
 
-    def _add_i2p_peer_interface(self, b32_address: str) -> dict:
-        """Add an I2P peer interface at runtime."""
+    def _add_i2p_peer_interface(self, b32_address: str, mode: str = "full") -> dict:
+        """Add an I2P peer interface at runtime.
+
+        Args:
+            b32_address: Full B32 address (e.g. ``xxxx.b32.i2p``).
+            mode: ``"full"`` (default) or ``"boundary"``.  When ``"boundary"``,
+                  the persisted RNS config section will include
+                  ``mode = boundary``, ``ingress_control = yes``, and
+                  ``ic_max_held_announces = 0``.
+        """
         try:
             import RNS
             from RNS.Interfaces.I2PInterface import I2PInterface as RNS_I2PInterface
@@ -2491,12 +2562,25 @@ class RatholeDaemon:
             # is_connected_to_shared_instance=True.  We must set the
             # required attributes manually so the interface is properly
             # registered and announces flow through it.
+            # Map the human-readable mode string to the RNS integer constant.
+            # This must be done for BOTH shared-instance and standalone paths so
+            # the live interface object carries the correct mode (e.g. MODE_BOUNDARY
+            # for boundary mode) rather than always defaulting to MODE_FULL.
+            from RNS.Interfaces.Interface import Interface as _RNSIface
+            _i2p_mode_map = {
+                "full":           _RNSIface.MODE_FULL,
+                "boundary":       _RNSIface.MODE_BOUNDARY,
+                "gateway":        _RNSIface.MODE_GATEWAY,
+                "access_point":   _RNSIface.MODE_ACCESS_POINT,
+                "roaming":        _RNSIface.MODE_ROAMING,
+                "point_to_point": _RNSIface.MODE_POINT_TO_POINT,
+            }
+            _interface_mode = _i2p_mode_map.get(mode.lower(), _RNSIface.MODE_FULL)
             is_shared = getattr(self._rns_instance, "is_connected_to_shared_instance", False)
             if is_shared:
-                from RNS.Interfaces.Interface import Interface as _RNSIface
                 interface.OUT  = True
                 interface.IN   = True
-                interface.mode = _RNSIface.MODE_FULL
+                interface.mode = _interface_mode
                 interface.announce_cap          = RNS.Reticulum.ANNOUNCE_CAP / 100.0
                 interface.announce_rate_target  = None
                 interface.announce_rate_grace   = None
@@ -2512,20 +2596,25 @@ class RatholeDaemon:
                 except Exception as _fi_err:
                     log.debug("I2P peer final_init (shared client): %s", _fi_err)
                 log.info(
-                    "Added I2P peer (shared-instance manual init): %s", b32_address[:16]
+                    "Added I2P peer (shared-instance manual init): %s mode=%s(%s)",
+                    b32_address[:16], mode, _interface_mode,
                 )
             else:
-                self._rns_instance._add_interface(interface)
+                # Pass mode= explicitly so RNS sets the correct interface mode on the
+                # live object.  Without this, _add_interface() defaults to MODE_FULL
+                # regardless of what was written to the config file — the same bug
+                # that was already fixed for LoRa (see _add_lora_interface line ~2836).
+                self._rns_instance._add_interface(interface, mode=_interface_mode)
 
             self._i2p_interfaces.append(interface)
             # Mark as "new" so the TUI shows "Connecting" (first-time tunnel
             # establishment) rather than "Checking…" (status poll after reconnect).
             # The flag is cleared once the peer becomes connected for the first time.
-            self._i2p_peers.append({"name": name, "b32": b32_address, "new": True})
-            log.info("Added I2P peer: %s", b32_address[:16])
+            self._i2p_peers.append({"name": name, "b32": b32_address, "new": True, "mode": mode})
+            log.info("Added I2P peer: %s (mode=%s)", b32_address[:16], mode)
 
-            self._persist_i2p_interface(name, b32_address)
-            return {"ok": True, "name": name}
+            self._persist_i2p_interface(name, b32_address, mode=mode)
+            return {"ok": True, "name": name, "mode": mode}
         except Exception as e:
             log.error("Failed to add I2P peer %s: %s", b32_address[:16], e)
             return {"ok": False, "error": str(e)}
@@ -2585,9 +2674,23 @@ class RatholeDaemon:
                     # Use object identity (is not target) rather than name comparison
                     # so that long-name rnsd interfaces are correctly removed even
                     # when their name differs from the short ``name`` argument.
+                    # Also remove any OTHER interface objects that share the same
+                    # short name or long-name prefix — these are stale duplicates
+                    # left from a previous session that were not cleaned up on
+                    # startup (e.g. OUT=True short-name objects that survived the
+                    # _init_reticulum dedup pass).  Removing them here ensures the
+                    # re-add path starts with a clean slate.
                     remaining = [
                         i for i in RNS.Transport.interfaces
                         if i is not target
+                        and not (
+                            "I2P" in type(i).__name__
+                            and not getattr(i, "connectable", False)
+                            and (
+                                (getattr(i, "name", "") or "") == name
+                                or (getattr(i, "name", "") or "").startswith(name + " ")
+                            )
+                        )
                     ]
                     if len(remaining) < len(RNS.Transport.interfaces):
                         RNS.Transport.interfaces[:] = remaining
@@ -2638,7 +2741,7 @@ class RatholeDaemon:
         except Exception as e:
             log.warning("Failed to unpersist I2P interface %s: %s", name, e)
 
-    def _persist_i2p_interface(self, name: str, b32_address: str):
+    def _persist_i2p_interface(self, name: str, b32_address: str, mode: str = "full"):
         """Write the I2P peer to the RNS config file for persistence across restarts."""
         try:
             from .i2p import add_rns_i2p_interface
@@ -2648,8 +2751,8 @@ class RatholeDaemon:
             else:
                 config_file = _default_rns_dir() / "config"
             if config_file.exists():
-                add_rns_i2p_interface(config_file, name, peers=[b32_address])
-                log.info("Persisted I2P peer %s to %s", name, config_file)
+                add_rns_i2p_interface(config_file, name, peers=[b32_address], mode=mode)
+                log.info("Persisted I2P peer %s (mode=%s) to %s", name, mode, config_file)
         except Exception as e:
             log.warning("I2P peer active but failed to persist: %s", e)
 
