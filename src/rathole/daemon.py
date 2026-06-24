@@ -444,15 +444,33 @@ class RatholeDaemon:
         if hasattr(RNS.Transport, "identity") and RNS.Transport.identity:
             log.info("Transport identity: %s", RNS.Transport.identity.hexhash)
 
-        # Log active interfaces and detect duplicate I2P peers.
-        # rnsd names I2P peer interfaces "I2P Peer <b32[:8]> to <full_b32>"
-        # while rathole uses "I2P Peer <b32[:8]>".  If both appear in
-        # Transport.interfaces, the short-name one was added by rathole as a
-        # shared-instance client with OUT=False and no mode — it will NOT
-        # forward announces.  Log a warning so the operator can diagnose.
+        # Log active interfaces and auto-remove stale duplicate I2P peer interfaces.
+        #
+        # When rathole runs as a shared-instance client and adds an I2P peer via
+        # _add_i2p_peer_interface(), it registers the interface in Transport.interfaces
+        # with the SHORT name "I2P Peer <b32[:8]>" and also persists it to the RNS
+        # config file as [[I2P Peer <b32[:8]>]].
+        #
+        # On the next startup rnsd reads the RNS config and loads the same peer with
+        # the LONG name "I2P Peer <b32[:8]> to <full_b32>".  The short-name object
+        # from the previous rathole session is still alive in Transport.interfaces
+        # (rnsd kept it).  This creates two interfaces for the same peer:
+        #   • short-name — stale rathole-added object, OUT=False, non-functional
+        #   • long-name  — rnsd-managed, OUT=True, fully functional
+        #
+        # Fix: silently detach and remove the stale short-name interface so only
+        # the rnsd-managed long-name one remains.  No operator action required.
+        #
+        # IMPORTANT: Only remove a short-name interface when it is genuinely stale
+        # (i.e. OUT=False, meaning it was never properly initialized by rnsd).
+        # If rnsd itself uses the short name (because the config section is named
+        # [[I2P Peer <b32[:8]>]]), the interface will have OUT=True and must NOT
+        # be removed — it is the live rnsd-managed tunnel, not a leftover from a
+        # previous rathole session.  Removing it would kill the tunnel and leave
+        # rnstatus stuck at "Creating Tunnel" forever.
         iface_names = []
-        i2p_peer_short_names: set[str] = set()
-        i2p_peer_long_names:  set[str] = set()
+        i2p_peer_short_ifaces: dict[str, object] = {}   # short_name → iface object
+        i2p_peer_long_names:   set[str] = set()
         if hasattr(RNS.Transport, "interfaces"):
             for iface in RNS.Transport.interfaces:
                 name = getattr(iface, "name", None) or str(type(iface).__name__)
@@ -462,22 +480,58 @@ class RatholeDaemon:
                     if " to " in name:
                         i2p_peer_long_names.add(name)
                     else:
-                        i2p_peer_short_names.add(name)
+                        # Only treat as a stale rathole-added object if OUT=False.
+                        # rnsd-managed interfaces always have OUT=True; rathole-added
+                        # objects that were not cleaned up on the previous shutdown
+                        # have OUT=False (they were never fully initialized by rnsd).
+                        if not getattr(iface, "OUT", True):
+                            i2p_peer_short_ifaces[name] = iface
+                        else:
+                            log.debug(
+                                "Short-name I2P peer interface '%s' has OUT=True — "
+                                "treating as rnsd-managed, will not remove",
+                                name,
+                            )
+
+        # Auto-remove stale short-name I2P peer interfaces that have a matching
+        # rnsd-managed long-name counterpart already in Transport.interfaces.
+        # Only interfaces with OUT=False are candidates (see collection logic above).
+        stale_removed: list[str] = []
+        for short, stale_iface in i2p_peer_short_ifaces.items():
+            for long in i2p_peer_long_names:
+                if long.startswith(short + " to "):
+                    log.debug(
+                        "Removing stale short-name I2P peer interface '%s' "
+                        "(rnsd-managed '%s' already present, OUT=False confirms stale)",
+                        short, long,
+                    )
+                    try:
+                        if hasattr(stale_iface, "detach"):
+                            stale_iface.detach()
+                    except Exception:
+                        pass
+                    try:
+                        RNS.Transport.interfaces.remove(stale_iface)
+                    except (ValueError, AttributeError):
+                        pass
+                    stale_removed.append(short)
+                    # Remove from iface_names list so the count is accurate
+                    try:
+                        iface_names.remove(short)
+                    except ValueError:
+                        pass
+                    break
+
+        if stale_removed:
+            log.info(
+                "Removed %d stale I2P peer interface(s) left from previous session "
+                "(rnsd-managed versions already active): %s",
+                len(stale_removed), ", ".join(stale_removed),
+            )
+
         log.info("Interfaces active: %d%s",
                  len(iface_names),
                  f" ({', '.join(iface_names)})" if iface_names else "")
-
-        # Warn about duplicate I2P peer interfaces (short + long name for same peer)
-        for short in i2p_peer_short_names:
-            for long in i2p_peer_long_names:
-                if long.startswith(short + " to "):
-                    log.warning(
-                        "Duplicate I2P peer interface detected: '%s' (rathole-added, OUT=False) "
-                        "and '%s' (rnsd-managed, OUT=True). The short-name interface was added "
-                        "by rathole as a shared-instance client and is non-functional. "
-                        "Remove it via 'rat network remove i2p-peer %s' and restart.",
-                        short, long, short,
-                    )
 
         # ── Log LoRa interface details at startup ─────────────────────
         # Prints mode, frequency, SF, BW, and online status for every
@@ -2265,12 +2319,18 @@ class RatholeDaemon:
             log.warning("I2P server active but failed to persist: %s", e)
 
     def _sync_i2p_peers_from_transport(self):
-        """Backfill _i2p_peers from the RNS config file at startup.
+        """Backfill _i2p_peers from the RNS config file and live Transport at startup.
 
         Called once after _init_reticulum().  Reads the persisted
         [[I2PInterface]] sections (connectable=no) from the RNS config file
         and populates _i2p_peers so the TUI shows them immediately on a
         fresh start without requiring a manual add via the TUI.
+
+        Also scans Transport.interfaces for long-name rnsd-managed peer
+        interfaces ("I2P Peer <b32[:8]> to <full_b32>") that may not have a
+        matching RNS config section (e.g. added by rnsd directly or with a
+        non-standard section name).  These are backfilled using the short name
+        derived from the long name so the TUI can display and manage them.
 
         The status (Checking/Connected) is determined at runtime by the
         status command scanning RNS.Transport.interfaces every 5 seconds.
@@ -2295,6 +2355,8 @@ class RatholeDaemon:
             # Also collect existing B32 addresses to prevent duplicate-by-address
             existing_b32s = {p.get("b32", "") for p in self._i2p_peers}
             count = 0
+
+            # Pass 1: backfill from RNS config file sections (primary source)
             for entry in list_rns_i2p_peers(config_file):
                 b32 = entry.get("b32", "").strip()
                 if not b32:
@@ -2310,8 +2372,44 @@ class RatholeDaemon:
                 existing_b32s.add(b32)
                 count += 1
                 log.info("Loaded I2P peer from config at startup: %s (%s)", short_name, b32[:16])
+
+            # Pass 2: backfill from live Transport.interfaces for rnsd-managed
+            # long-name peer interfaces not covered by the config file scan.
+            # Long name format: "I2P Peer <b32[:8]> to <full_b32>"
+            # This catches peers that rnsd loaded from its own config sections
+            # with non-standard names or that were added outside of rathole.
+            try:
+                import RNS as _RNS
+                for _iface in _RNS.Transport.interfaces:
+                    if "I2P" not in type(_iface).__name__:
+                        continue
+                    if getattr(_iface, "connectable", False):
+                        continue  # skip server interfaces
+                    _iname = getattr(_iface, "name", "") or ""
+                    if " to " not in _iname:
+                        continue  # skip short-name (stale) interfaces
+                    # Extract b32 from long name: "I2P Peer xxxxxxxx to full.b32.i2p"
+                    _b32 = _iname.split(" to ", 1)[1].strip()
+                    if not _b32:
+                        continue
+                    if _b32 in existing_b32s:
+                        continue
+                    _short = f"I2P Peer {_b32[:8]}"
+                    if _short in existing_names:
+                        continue
+                    self._i2p_peers.append({"name": _short, "b32": _b32})
+                    existing_names.add(_short)
+                    existing_b32s.add(_b32)
+                    count += 1
+                    log.info(
+                        "Loaded I2P peer from live transport at startup: %s (%s)",
+                        _short, _b32[:16],
+                    )
+            except Exception as _te:
+                log.debug("Could not scan Transport.interfaces for I2P peers: %s", _te)
+
             if count:
-                log.info("Backfilled %d I2P peer(s) from RNS config", count)
+                log.info("Backfilled %d I2P peer(s) from RNS config/transport", count)
         except Exception as e:
             log.warning("Could not load I2P peers from config at startup: %s", e)
 
@@ -2443,6 +2541,12 @@ class RatholeDaemon:
         Also clears in-memory tracking (_i2p_peers, _i2p_interfaces) and removes
         the section from the RNS config file so the interface does not reappear
         after rnsd restarts.
+
+        ``name`` is always the SHORT form "I2P Peer <b32[:8]>".  rnsd may have
+        loaded the same peer with the LONG form "I2P Peer <b32[:8]> to <full_b32>"
+        (when the config section is named with the short form but rnsd expands it
+        internally).  We match both forms so the detach always succeeds regardless
+        of which naming convention rnsd used.
         """
         try:
             import RNS
@@ -2455,9 +2559,12 @@ class RatholeDaemon:
 
             target = None
             for iface in list(RNS.Transport.interfaces):
-                if getattr(iface, "name", "") == name:
-                    target = iface
-                    break
+                iface_name = getattr(iface, "name", "") or ""
+                # Match exact short name OR long name that starts with short name + " to "
+                if iface_name == name or iface_name.startswith(name + " to "):
+                    if "I2P" in type(iface).__name__ and not getattr(iface, "connectable", False):
+                        target = iface
+                        break
 
             if target is None:
                 # Not live — may still be in config; try to remove from config anyway
@@ -2475,19 +2582,22 @@ class RatholeDaemon:
                     pass
 
                 try:
+                    # Use object identity (is not target) rather than name comparison
+                    # so that long-name rnsd interfaces are correctly removed even
+                    # when their name differs from the short ``name`` argument.
                     remaining = [
                         i for i in RNS.Transport.interfaces
-                        if getattr(i, "name", "") != name
+                        if i is not target
                     ]
                     if len(remaining) < len(RNS.Transport.interfaces):
                         RNS.Transport.interfaces[:] = remaining
                 except Exception as e:
                     log.debug("Could not filter transport interfaces: %s", e)
 
-                # Remove from our tracking list
+                # Remove from our tracking list (by object identity)
                 self._i2p_interfaces = [
                     i for i in self._i2p_interfaces
-                    if getattr(i, "name", "") != name
+                    if i is not target
                 ]
 
             # Remove from in-memory peers list
