@@ -267,7 +267,7 @@ def _hooked_inbound(raw, receiving_interface):
                     _iname,
                 )
             elif _is_i2p:
-                log.info(
+                log.debug(
                     "I2P ANNOUNCE received: dest=%s hops=%d size=%d via [%s]",
                     ctx.destination_hash[:16] if ctx.destination_hash else "?",
                     ctx.hop_count,
@@ -286,12 +286,10 @@ def _hooked_inbound(raw, receiving_interface):
         verdict = _router.evaluate(ctx)
 
         if verdict.dropped:
-            # Log I2P drops at INFO (not just DEBUG) so bridging failures
-            # are visible without enabling DEBUG logging globally.
             _iname = ctx.interface_name or ""
             _is_i2p = "I2P" in _iname or "i2p" in _iname.lower()
             if _is_i2p and ctx.is_announce:
-                log.info(
+                log.debug(
                     "I2P ANNOUNCE DROPPED by filter '%s': dest=%s hops=%d reason=%s",
                     verdict.filter_name,
                     ctx.destination_hash[:16] if ctx.destination_hash else "?",
