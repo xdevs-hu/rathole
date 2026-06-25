@@ -2554,7 +2554,19 @@ def _build_tui(sock_path: str, refresh_interval: float = 5.0,
         def _do_peer_pin_trusted(self, peer_hash: str) -> None:
             resp = self._send("reputation", {"action": "pin", "identity": peer_hash, "score": 1.0})
             if resp.get("ok"):
-                self.notify(f"Pinned {peer_hash[:16]}... as TRUSTED", severity="information")
+                added = resp.get("added_to_trusted_peers", False)
+                if added:
+                    self.notify(
+                        f"Pinned {peer_hash[:16]}... as TRUSTED — "
+                        f"added to trusted_peers filter (I2P announces now allowed). "
+                        f"Remove via config file only.",
+                        severity="information",
+                    )
+                else:
+                    self.notify(
+                        f"Pinned {peer_hash[:16]}... as TRUSTED",
+                        severity="information",
+                    )
                 self._force_peers_refresh = True
                 self.refresh_data()
             else:

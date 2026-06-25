@@ -1468,7 +1468,15 @@ class RatholeDaemon:
                     return {"ok": False, "error": err}
                 score = float(args.get("score", 1.0))
                 self.reputation.pin(identity, score)
-                return {"ok": True, "pinned": True, "score": score}
+                # Also add to trusted_peers.peers so the filter allows this
+                # peer's I2P announces through to LoRa.  Uses the first 16
+                # hex chars of the RNS identity hash as the prefix — this is
+                # the same hash shown in the TUI Peers tab.  For ANNOUNCE
+                # packets peer_hash == destination_hash (set by the hook).
+                # Removal is config-file-only (by design — no TUI remove).
+                added_to_trusted = self._add_to_trusted_peers(identity)
+                return {"ok": True, "pinned": True, "score": score,
+                        "added_to_trusted_peers": added_to_trusted}
             elif action == "unpin":
                 if not identity:
                     return {"ok": False, "error": "identity required"}
@@ -3008,6 +3016,67 @@ class RatholeDaemon:
             log.info("Persisted LoRa interface %s (mode=%s) to %s", name, mode, config_file)
         except Exception as e:
             log.warning("LoRa interface active but failed to persist: %s", e)
+
+    def _add_to_trusted_peers(self, identity: str) -> bool:
+        """Add *identity* to ``filters.trusted_peers.peers`` and save config.
+
+        Called automatically when a peer is pinned as TRUSTED via the TUI.
+        Stores the first 16 hex characters of the RNS identity hash as the
+        prefix — this is the same hash shown in the TUI Peers tab.  For
+        ANNOUNCE packets ``peer_hash == destination_hash`` (set by the hook),
+        so the filter correctly matches the announcing identity.
+
+        Side-effects
+        ------------
+        * Appends the 16-char prefix to ``filters.trusted_peers.peers``.
+        * Sets ``filters.trusted_peers.enabled = true`` so the filter
+          activates immediately — without this the peers list has no effect
+          because the filter is disabled by default.
+        * Calls ``_propagate_config()`` so the live TrustedPeerFilter
+          instance picks up the new peer without a daemon restart.
+        * Calls ``save_config()`` so the change is written to the TOML file
+          and survives a daemon restart.
+
+        Returns True if the peer was newly added, False if already present.
+        Removal is intentionally config-file-only (no TUI remove) so operators
+        must edit the TOML to revoke trusted status.
+        """
+        try:
+            prefix = identity[:16].lower()
+            tp_cfg = self.config.raw.setdefault("filters", {}).setdefault(
+                "trusted_peers", {}
+            )
+            peers: list = tp_cfg.setdefault("peers", [])
+            # Normalise existing entries for comparison
+            existing = {str(p).strip().lower() for p in peers}
+            if prefix in existing:
+                log.debug("trusted_peers: %s already in peers list", prefix)
+                return False
+            peers.append(prefix)
+            tp_cfg["peers"] = peers
+            # Enable the filter so the peers list actually takes effect.
+            # The filter is disabled by default (safe for non-LoRa nodes);
+            # once the operator pins a trusted peer we activate it so I2P
+            # announces from that peer are allowed through to LoRa.
+            was_disabled = not tp_cfg.get("enabled", False)
+            tp_cfg["enabled"] = True
+            self._propagate_config()
+            save_config(self.config)
+            if was_disabled:
+                log.info(
+                    "Added %s to trusted_peers.peers and enabled trusted_peers filter "
+                    "(pinned as TRUSTED via TUI)",
+                    prefix,
+                )
+            else:
+                log.info(
+                    "Added %s to trusted_peers.peers (pinned as TRUSTED via TUI)",
+                    prefix,
+                )
+            return True
+        except Exception as e:
+            log.warning("Could not add peer to trusted_peers: %s", e)
+            return False
 
     def _propagate_config(self):
         """Push current config to all subsystems that cache config values."""

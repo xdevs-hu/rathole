@@ -31,6 +31,18 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "control_socket": _default_control_socket(),
     },
     "filters": {
+        # ── Trusted peers (I2P→LoRa gate) — must be first in announce pipeline ──
+        # Disabled by default so new installs work out of the box.
+        # Enable on LoRa gateway nodes to block internet announce floods from
+        # reaching LoRa devices.  peers=[] blocks ALL I2P announces.
+        # Add peer hash prefixes to allow specific I2P peers through.
+        # lora_max_hops: secondary ceiling for trusted peers (TCP client→VPS→RPi4 = 2 hops).
+        "trusted_peers": {
+            "enabled": False,     # Enable on LoRa gateway nodes only
+            "i2p_only": True,
+            "lora_max_hops": 4,   # TCP client→VPS→RPi4 = 2 hops; 4 gives headroom for one relay
+            "peers": [],          # empty = block all I2P announces when enabled
+        },
         "allowdeny": {
             "enabled": True,
             "allow_destinations": [],
@@ -203,13 +215,24 @@ DEFAULT_CONFIG: dict[str, Any] = {
 
 
 def _deep_merge(base: dict, overlay: dict) -> dict:
-    """Recursively merge overlay into base, preferring overlay values."""
-    merged = base.copy()
+    """Recursively merge overlay into base, preferring overlay values.
+
+    Returns a fully independent copy — no dict in the result shares identity
+    with any dict in *base* or *overlay*.  This prevents mutations of the
+    returned dict from accidentally modifying DEFAULT_CONFIG or the caller's
+    original data structures.
+    """
+    import copy as _copy
+    merged = {}
+    # Deep-copy every key from base first so we start with independent objects
+    for key, val in base.items():
+        merged[key] = _copy.deepcopy(val)
+    # Overlay: recursively merge dicts, replace everything else
     for key, val in overlay.items():
         if key in merged and isinstance(merged[key], dict) and isinstance(val, dict):
             merged[key] = _deep_merge(merged[key], val)
         else:
-            merged[key] = val
+            merged[key] = _copy.deepcopy(val)
     return merged
 
 
@@ -457,10 +480,15 @@ def reload_config(current: RatholeConfig) -> RatholeConfig:
 def save_config(config: "RatholeConfig") -> bool:
     """Persist the current in-memory config back to the TOML file on disk.
 
-    Only the keys that differ from DEFAULT_CONFIG are written, keeping the
-    file human-readable.  Keys that match the default are omitted so the
-    file stays minimal.  On the next ``reload_config`` call the saved file
-    is read and merged back over defaults, restoring the full config.
+    Strategy: read the existing on-disk TOML (if any), deep-merge the
+    current in-memory config on top of it, then write back only the keys
+    that differ from DEFAULT_CONFIG.
+
+    This preserves every setting the user explicitly wrote to the file —
+    even values that happen to equal the default — while still keeping the
+    file minimal.  Without this merge step, a ``save_config`` call (e.g.
+    triggered by "Pin Trusted") would overwrite the entire file with only
+    the changed keys, silently discarding all other user settings.
 
     Returns True on success, False on failure (errors are logged).
     """
@@ -468,8 +496,25 @@ def save_config(config: "RatholeConfig") -> bool:
         log.warning("Cannot save config: no config_path set (started with defaults only)")
         return False
 
-    # Build a minimal dict containing only values that differ from defaults.
-    # This keeps the saved file clean and avoids bloating it with every default.
+    # ── Step 1: load what is currently on disk ────────────────────
+    # We start from the on-disk file so that any keys the user wrote
+    # explicitly (even if they equal the default) are preserved.
+    on_disk: dict = {}
+    if config.config_path.exists():
+        try:
+            with open(config.config_path, "rb") as _f:
+                on_disk = tomllib.load(_f)
+        except Exception as _e:
+            log.warning("Could not read existing config for merge: %s — will overwrite", _e)
+
+    # ── Step 2: deep-merge in-memory config on top of on-disk ─────
+    # config.raw already contains the fully-merged (defaults + user)
+    # state, so merging it over on_disk produces a dict that has:
+    #   • every key the user wrote to disk (preserved)
+    #   • every live change made at runtime (e.g. new trusted peer)
+    merged_on_disk = _deep_merge(on_disk, config.raw)
+
+    # ── Step 3: diff against defaults to keep the file minimal ────
     def _diff_from_defaults(current: dict, defaults: dict) -> dict:
         """Return only the keys in *current* that differ from *defaults*."""
         out: dict = {}
@@ -483,7 +528,7 @@ def save_config(config: "RatholeConfig") -> bool:
                 out[k] = v
         return out
 
-    to_write = _diff_from_defaults(config.raw, DEFAULT_CONFIG)
+    to_write = _diff_from_defaults(merged_on_disk, DEFAULT_CONFIG)
     toml_text = _simple_toml_dumps(to_write)
 
     try:
@@ -501,6 +546,17 @@ def _simple_toml_dumps(data: dict, _prefix: str = "") -> str:
     Handles: bool, int, float, str, list (of str/int/float), nested dicts
     (rendered as TOML tables).  Does NOT handle dates, inline tables, or
     arrays of tables — none of which appear in rathole's config schema.
+
+    Rules
+    -----
+    * A ``[section]`` header is emitted only when the section has at least
+      one scalar key directly under it.  Pure-container sections (e.g.
+      ``[filters]`` that only holds sub-tables like ``[filters.trusted_peers]``)
+      are skipped — the leaf sub-table headers are self-sufficient in TOML
+      and an empty ``[filters]`` header would be misleading.
+    * Sub-tables are always rendered after all scalars in the current section
+      so that TOML parsers see a well-formed file.
+    * The top-level call (``_prefix=""``) never emits a header for itself.
     """
     lines: list[str] = []
     deferred: list[tuple[str, dict]] = []  # nested tables written after scalars
@@ -533,12 +589,28 @@ def _simple_toml_dumps(data: dict, _prefix: str = "") -> str:
                     items.append(str(item))
             lines.append(f"{k} = [{', '.join(items)}]")
 
-    result = "\n".join(lines)
-    if result:
+    # Build the scalar block for this section.
+    # Emit a [section] header only when:
+    #   1. We are inside a recursive call (_prefix is set), AND
+    #   2. There is at least one scalar key at this level.
+    # Pure-container sections (only sub-tables) skip the header entirely;
+    # their children will emit their own fully-qualified headers.
+    result = ""
+    if lines and _prefix:
+        result = f"\n[{_prefix}]\n"
+    result += "\n".join(lines)
+    if lines:
         result += "\n"
 
+    # Recurse into sub-tables.  Each sub-table call returns a block that
+    # already starts with its own ``\n[full.key]\n`` header (if it has
+    # scalars) or directly with its children's headers.
     for full_key, sub in deferred:
-        result += f"\n[{full_key}]\n"
         result += _simple_toml_dumps(sub, _prefix=full_key)
+
+    # At the top-level call only, strip a leading newline that arises when
+    # the very first section has scalars (its header starts with "\n[...]").
+    if not _prefix and result.startswith("\n"):
+        result = result[1:]
 
     return result
