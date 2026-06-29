@@ -87,6 +87,16 @@ burst = 50
 # Action when rate exceeded: "drop" or "throttle"
 overflow_action = "drop"
 
+# Exempt I2P interfaces from the per-interface packet rate limit.
+#
+# I2P traffic is already rate-limited by i2pd and the SAM protocol at
+# the tunnel layer.  Applying a single coarse token bucket across all
+# I2P peers causes the bucket to exhaust under normal load and drops
+# packets before they can be forwarded to LoRa (breaking I2P→LoRa
+# bridging).  Set to false only if you need explicit I2P ingress caps
+# on a high-traffic public gateway.
+exempt_i2p = true
+
 
 # ─── G2. Bandwidth Cap ────────────────────────────────────────
 #
@@ -107,6 +117,11 @@ burst_bytes = 1_000_000
 #
 # Drops any packet exceeding a maximum size. Reticulum's MTU is
 # 500 bytes for single packets; this provides a safety margin.
+#
+# By default this filter only applies to LoRa inbound packets.
+# I2P and TCP packets may legitimately exceed 500 bytes due to SAM
+# framing and tunnel overhead; RNS handles fragmentation before
+# forwarding to LoRa, so dropping them here breaks I2P→LoRa bridging.
 
 [filters.packet_size]
 enabled = true
@@ -114,10 +129,65 @@ enabled = true
 # Maximum packet size in bytes. Packets larger than this are dropped.
 max_bytes = 600
 
+# Only enforce the size cap on LoRa inbound packets (default: true).
+# Set to false to enforce globally on all interface types.
+# WARNING: setting false will drop oversized I2P packets before they
+# can be forwarded to LoRa, breaking I2P→LoRa bridging.
+lora_only = true
+
 
 # ═══════════════════════════════════════════════════════════════════
 # ANNOUNCE FILTERS — applied to ANNOUNCE packets only
 # ═══════════════════════════════════════════════════════════════════
+
+
+# ─── A0. Trusted I2P Peers (LoRa gateway protection) ─────────────
+#
+# Gates which I2P announces are allowed to reach LoRa devices.
+# This filter runs FIRST in the announce pipeline, before allowdeny,
+# hop_ceiling, rate_limit, etc.
+#
+# Use case — RPi4 LoRa gateway:
+#   peers = []  →  block ALL I2P announces from reaching LoRa.
+#                  Only LoRa-originated announces propagate to I2P/TCP,
+#                  not the reverse.  Prevents internet announce floods
+#                  from consuming LoRa airtime.
+#
+#   peers = ["6cuklfwz"]  →  allow announces from this peer hash prefix
+#                             through to LoRa (e.g. a trusted VPS gateway).
+#                             All other I2P announces are still blocked.
+#                             Use the hash shown in the TUI Peers tab —
+#                             the first 8–16 hex chars are enough.
+#
+# When i2p_only = true (default), TCP and LoRa announces are completely
+# unaffected — they bypass this filter entirely.
+#
+# lora_max_hops: secondary ceiling applied only to trusted peers.
+#   TCP client → VPS → RPi4 = 2 hops.  Default 4 gives headroom for
+#   one relay while blocking deep-network noise (5+ hops).
+#   Irrelevant when peers = [] since all I2P announces are dropped first.
+#
+# TUI integration: "Pin Trusted" on a peer in the Peers tab automatically
+# adds its hash prefix to this list, enables the filter, and saves the
+# config.  Removal is config-file-only.
+
+[filters.trusted_peers]
+enabled = false   # Enable on LoRa gateway nodes (RPi4 etc.) — off by default
+
+# Only apply to I2P interfaces. Set false to apply to all interfaces.
+i2p_only = true
+
+# Maximum hop count for announces from trusted I2P peers.
+# TCP client→VPS→RPi4 = 2 hops; 4 allows one relay, blocks deep noise.
+lora_max_hops = 4
+
+# Whitelist of peer hash prefixes (full hash or first 8–16 hex chars).
+# Empty = block ALL I2P announces (LoRa gateway mode, recommended default).
+# Add entries via TUI "Pin Trusted" or manually here.
+peers = [
+    # "6cuklfwz",   # example: VPS gateway short prefix
+    # "aabbccdd1122eeff",  # example: full 16-char prefix
+]
 
 
 # ─── A1. Allow / Deny Lists ──────────────────────────────────────

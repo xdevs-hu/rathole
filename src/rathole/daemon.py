@@ -444,12 +444,91 @@ class RatholeDaemon:
         if hasattr(RNS.Transport, "identity") and RNS.Transport.identity:
             log.info("Transport identity: %s", RNS.Transport.identity.hexhash)
 
-        # Log active interfaces
+        # Log active interfaces and auto-remove stale duplicate I2P peer interfaces.
+        #
+        # When rathole runs as a shared-instance client and adds an I2P peer via
+        # _add_i2p_peer_interface(), it registers the interface in Transport.interfaces
+        # with the SHORT name "I2P Peer <b32[:8]>" and also persists it to the RNS
+        # config file as [[I2P Peer <b32[:8]>]].
+        #
+        # On the next startup rnsd reads the RNS config and loads the same peer with
+        # the LONG name "I2P Peer <b32[:8]> to <full_b32>".  The short-name object
+        # from the previous rathole session is still alive in Transport.interfaces
+        # (rnsd kept it).  This creates two interfaces for the same peer:
+        #   • short-name — stale rathole-added object, OUT=False, non-functional
+        #   • long-name  — rnsd-managed, OUT=True, fully functional
+        #
+        # Fix: silently detach and remove the stale short-name interface so only
+        # the rnsd-managed long-name one remains.  No operator action required.
+        #
+        # IMPORTANT: Only remove a short-name interface when it is genuinely stale
+        # (i.e. OUT=False, meaning it was never properly initialized by rnsd).
+        # If rnsd itself uses the short name (because the config section is named
+        # [[I2P Peer <b32[:8]>]]), the interface will have OUT=True and must NOT
+        # be removed — it is the live rnsd-managed tunnel, not a leftover from a
+        # previous rathole session.  Removing it would kill the tunnel and leave
+        # rnstatus stuck at "Creating Tunnel" forever.
         iface_names = []
+        i2p_peer_short_ifaces: dict[str, object] = {}   # short_name → iface object
+        i2p_peer_long_names:   set[str] = set()
         if hasattr(RNS.Transport, "interfaces"):
             for iface in RNS.Transport.interfaces:
                 name = getattr(iface, "name", None) or str(type(iface).__name__)
                 iface_names.append(name)
+                if "I2P" in type(iface).__name__ and not getattr(iface, "connectable", False):
+                    # Long name: "I2P Peer xxxxxxxx to xxxxxxxx…b32.i2p"
+                    if " to " in name:
+                        i2p_peer_long_names.add(name)
+                    else:
+                        # Only treat as a stale rathole-added object if OUT=False.
+                        # rnsd-managed interfaces always have OUT=True; rathole-added
+                        # objects that were not cleaned up on the previous shutdown
+                        # have OUT=False (they were never fully initialized by rnsd).
+                        if not getattr(iface, "OUT", True):
+                            i2p_peer_short_ifaces[name] = iface
+                        else:
+                            log.debug(
+                                "Short-name I2P peer interface '%s' has OUT=True — "
+                                "treating as rnsd-managed, will not remove",
+                                name,
+                            )
+
+        # Auto-remove stale short-name I2P peer interfaces that have a matching
+        # rnsd-managed long-name counterpart already in Transport.interfaces.
+        # Only interfaces with OUT=False are candidates (see collection logic above).
+        stale_removed: list[str] = []
+        for short, stale_iface in i2p_peer_short_ifaces.items():
+            for long in i2p_peer_long_names:
+                if long.startswith(short + " to "):
+                    log.debug(
+                        "Removing stale short-name I2P peer interface '%s' "
+                        "(rnsd-managed '%s' already present, OUT=False confirms stale)",
+                        short, long,
+                    )
+                    try:
+                        if hasattr(stale_iface, "detach"):
+                            stale_iface.detach()
+                    except Exception:
+                        pass
+                    try:
+                        RNS.Transport.interfaces.remove(stale_iface)
+                    except (ValueError, AttributeError):
+                        pass
+                    stale_removed.append(short)
+                    # Remove from iface_names list so the count is accurate
+                    try:
+                        iface_names.remove(short)
+                    except ValueError:
+                        pass
+                    break
+
+        if stale_removed:
+            log.info(
+                "Removed %d stale I2P peer interface(s) left from previous session "
+                "(rnsd-managed versions already active): %s",
+                len(stale_removed), ", ".join(stale_removed),
+            )
+
         log.info("Interfaces active: %d%s",
                  len(iface_names),
                  f" ({', '.join(iface_names)})" if iface_names else "")
@@ -482,12 +561,60 @@ class RatholeDaemon:
                     iname, online, mode_str, mode_v,
                     freq, sf, bw, txpwr, bitrate,
                 )
-                # Log mode for visibility (full mode is intentional for testing)
-                if mode_v == 0:
-                    log.info(
-                        "LoRa [%s] is in FULL mode (peer transport node).",
+                # MODE_ACCESS_POINT (3) and MODE_ROAMING (4) both cause RNS
+                # Transport.outbound() to BLOCK announce re-propagation to this
+                # interface when attached_interface=None (the normal announce
+                # re-broadcast path from the announce table).
+                #
+                # Symptom: TX traffic visible on LoRa (rnsd heartbeats/path
+                # responses) but NO new announcements ever arrive at LoRa devices.
+                # The announces from I2P/TCP are accepted by rathole's filter but
+                # silently dropped by RNS before reaching the radio.
+                #
+                # Fix: set mode = full in the RNS config and restart rnsd.
+                # _ensure_transport_enabled() does this automatically before
+                # RNS.Reticulum() is called, so this warning means rnsd was
+                # already running with the wrong mode when rathole started.
+                if mode_v == 3:  # MODE_ACCESS_POINT
+                    log.warning(
+                        "LoRa [%s] is in ACCESS_POINT mode — announces from I2P/TCP "
+                        "will NOT be forwarded to LoRa! "
+                        "RNS Transport.outbound() blocks announce re-propagation on "
+                        "access_point interfaces. "
+                        "Fix: set 'mode = full' in the RNS config for this interface "
+                        "and restart rnsd.",
                         iname,
                     )
+                elif mode_v == 4:  # MODE_ROAMING
+                    log.warning(
+                        "LoRa [%s] is in ROAMING mode — announce re-propagation to "
+                        "LoRa may be restricted. "
+                        "For full I2P↔LoRa bridging, set 'mode = full' in the RNS "
+                        "config and restart rnsd.",
+                        iname,
+                    )
+
+                # Patch announce_cap on the live interface to 50% if it's still at
+                # the default 2%.  _ensure_transport_enabled() writes announce_cap=50
+                # to the config file, but RNS has already read the old config and
+                # initialized the interface with the old cap.  Patching the live
+                # object ensures the fix takes effect immediately without a restart.
+                #
+                # announce_cap is stored as a fraction (0.0–1.0) on the interface object.
+                # RNS default: ANNOUNCE_CAP=2 → 0.02.  Our target: 50% → 0.50.
+                _LORA_CAP_TARGET = 0.50
+                _current_cap = getattr(iface, "announce_cap", None)
+                if _current_cap is not None and _current_cap < _LORA_CAP_TARGET:
+                    try:
+                        iface.announce_cap = _LORA_CAP_TARGET
+                        log.info(
+                            "LoRa [%s] announce_cap patched: %.0f%% → %.0f%% "
+                            "(fixes I2P→LoRa announce forwarding; default 2%% causes "
+                            "12.8s gaps that exceed RNS rebroadcast window)",
+                            iname, (_current_cap * 100), (_LORA_CAP_TARGET * 100),
+                        )
+                    except Exception as _cap_err:
+                        log.debug("Could not patch announce_cap on %s: %s", iname, _cap_err)
 
     def _ensure_transport_enabled(self, rns_config_path):
         """Ensure the RNS config is correct before ``RNS.Reticulum()`` is called.
@@ -509,12 +636,24 @@ class RatholeDaemon:
             owns the RNodeInterface — rathole does not need to open the serial
             port directly.
 
-        ``RNodeInterface mode = access_point``
-            In ``access_point`` mode the RNode acts as a LoRa access point /
-            gateway — clients connect to it.  ``full`` mode is for peer
-            transport nodes that also relay traffic between other nodes.
-            Rathole operates as an access point, so ``access_point`` is the
-            correct mode.
+        ``RNodeInterface / RNodeMultiInterface mode = full`` (enforced)
+            RNS ``Transport.outbound()`` explicitly skips re-propagating
+            announces to any interface whose ``mode == MODE_ACCESS_POINT``
+            when ``attached_interface`` is None (i.e. normal announce
+            re-broadcast from the announce table).  This means that if the
+            LoRa interface is in ``access_point`` mode, announces arriving
+            from I2P or TCP will NEVER be forwarded to LoRa — the radio will
+            show TX traffic (rnsd heartbeats / path responses) but no new
+            announcements will ever reach LoRa devices.
+
+            ``access_point`` mode only re-propagates FROM LoRa clients TO
+            other interfaces, not the reverse.  ``full`` (or ``gateway``) is
+            required for bidirectional I2P↔LoRa bridging.
+
+            We enforce ``mode = full`` on every RNodeInterface /
+            RNodeMultiInterface section found in the config file so that
+            rnsd starts the radio in the correct mode on the next restart.
+            A WARNING is logged so the operator knows a restart is needed.
         """
         if rns_config_path:
             config_dir = Path(rns_config_path)
@@ -555,9 +694,84 @@ class RatholeDaemon:
                 log.info("share_instance set to Yes in %s (rathole uses shared rnsd instance)",
                          config_file)
 
-            # NOTE: RNodeInterface mode enforcement intentionally removed.
-            # Mode is preserved as-is from the config file to allow testing
-            # with mode = full (peer transport node mode).
+            # Enforce mode = full and announce_cap = 50 on all RNodeInterface /
+            # RNodeMultiInterface sections.
+            #
+            # ROOT CAUSE 1 — mode=access_point:
+            #   RNS Transport.outbound() explicitly skips re-propagating announces
+            #   to any interface in MODE_ACCESS_POINT when attached_interface is None
+            #   (normal announce re-broadcast path).  This means announces arriving
+            #   from I2P/TCP are NEVER forwarded to LoRa when the interface is in
+            #   access_point mode — the radio shows TX (rnsd heartbeats) but no new
+            #   announcements ever reach LoRa devices.
+            #   access_point mode only propagates FROM LoRa TO other interfaces.
+            #   full (or gateway) mode is required for bidirectional I2P↔LoRa bridging.
+            #
+            # ROOT CAUSE 2 — announce_cap too low (default 2%):
+            #   RNS default ANNOUNCE_CAP = 2% of interface bitrate.
+            #   LoRa at 6250 bps → cap = 125 bps → gap between announces = 12.8s.
+            #   RNS PATHFINDER_G rebroadcast grace window ≈ 11s.
+            #   Result: most I2P announces miss the rebroadcast window and are
+            #   silently dropped — the LoRa device never receives them.
+            #   Setting announce_cap = 50 (50%) reduces the gap to ~0.5s, ensuring
+            #   all queued announces are forwarded within the rebroadcast window.
+            #
+            # announce_cap in the RNS config is a percentage (0-100).
+            # RNS reads it as: announce_cap = config_value / 100.0
+            LORA_ANNOUNCE_CAP = 50  # 50% — allows ~1 announce per 0.5s at 6250 bps
+            ifaces_section = cfg.get("interfaces", {})
+            lora_mode_fixed = []
+            lora_cap_fixed = []
+            for iface_name, iface_cfg in ifaces_section.items():
+                if not isinstance(iface_cfg, dict):
+                    continue
+                itype = str(iface_cfg.get("type", "")).strip()
+                if itype not in ("RNodeInterface", "RNodeMultiInterface"):
+                    continue
+                imode = str(iface_cfg.get("mode", "")).strip().lower()
+                # Only fix modes that block outbound announce re-propagation.
+                # access_point: only propagates FROM LoRa TO other interfaces.
+                # roaming: restricts outbound re-propagation.
+                # empty: RNS defaults to access_point for RNodeInterface.
+                # full, boundary, gateway, point_to_point: all allow bidirectional
+                # announce re-propagation — do NOT overwrite these.
+                if imode in ("access_point", "roaming", ""):
+                    ifaces_section[iface_name]["mode"] = "full"
+                    changed = True
+                    lora_mode_fixed.append(iface_name)
+                # Enforce announce_cap if not set or below our minimum
+                current_cap_str = iface_cfg.get("announce_cap", None)
+                if current_cap_str is None:
+                    ifaces_section[iface_name]["announce_cap"] = str(LORA_ANNOUNCE_CAP)
+                    changed = True
+                    lora_cap_fixed.append(iface_name)
+                else:
+                    try:
+                        current_cap = float(current_cap_str)
+                        if current_cap < LORA_ANNOUNCE_CAP:
+                            ifaces_section[iface_name]["announce_cap"] = str(LORA_ANNOUNCE_CAP)
+                            changed = True
+                            lora_cap_fixed.append(iface_name)
+                    except (ValueError, TypeError):
+                        pass
+            if lora_mode_fixed:
+                log.warning(
+                    "FIXED: RNodeInterface(s) %s had mode=access_point/roaming — "
+                    "changed to mode=full in %s. "
+                    "RESTART rnsd for the change to take effect. "
+                    "Without this fix, announces from I2P/TCP are NEVER forwarded to LoRa "
+                    "(RNS Transport.outbound() blocks announces on access_point interfaces).",
+                    lora_mode_fixed, config_file,
+                )
+            if lora_cap_fixed:
+                log.info(
+                    "FIXED: RNodeInterface(s) %s had announce_cap < %d%% — "
+                    "set to %d%% in %s. "
+                    "RESTART rnsd for the change to take effect. "
+                    "Default 2%% cap causes 12.8s gaps between LoRa announces, "
+                    "causing most I2P announces to miss the rebroadcast window.",
+                    lora_cap_fixed, LORA_ANNOUNCE_CAP, LORA_ANNOUNCE_CAP, config_file,
+                )
 
             if changed:
                 cfg.write()
@@ -615,8 +829,129 @@ class RatholeDaemon:
                         changed = True
                         log.info("share_instance set to Yes in %s", config_file)
 
-                # NOTE: RNodeInterface mode enforcement intentionally removed.
-                # Mode is preserved as-is from the config file.
+                # Enforce mode = full and announce_cap = 50 on RNodeInterface /
+                # RNodeMultiInterface sections.
+                # Text-based fallback: scan for [[SectionName]] blocks whose type is
+                # RNodeInterface or RNodeMultiInterface and fix mode + announce_cap.
+                #
+                # ROOT CAUSE 1: RNS Transport.outbound() blocks announce re-propagation
+                # to any interface in MODE_ACCESS_POINT (attached_interface=None path).
+                # ROOT CAUSE 2: Default announce_cap=2% causes 12.8s gaps between LoRa
+                # announces, causing most I2P announces to miss the rebroadcast window.
+                _LORA_ANNOUNCE_CAP_TEXT = 50  # 50% — see configobj path for full comment
+                in_rnode_section = False
+                lora_mode_fixed_text = []
+                lora_cap_fixed_text = []
+                current_section_name = ""
+                # Track which RNode sections have announce_cap set
+                rnode_sections_with_cap: set = set()
+                # Two-pass: first collect which sections already have announce_cap
+                _cur_sec = ""
+                _in_rnode = False
+                for line in lines:
+                    stripped = line.strip()
+                    if stripped.startswith("[[") and stripped.endswith("]]"):
+                        _cur_sec = stripped[2:-2].strip()
+                        _in_rnode = False
+                    elif stripped.startswith("[") and not stripped.startswith("[["):
+                        _in_rnode = False
+                        _cur_sec = ""
+                    elif stripped.lower().startswith("type") and "=" in stripped:
+                        val = stripped.split("=", 1)[1].strip().lower()
+                        if val in ("rnodeinterface", "rnodemultiinterface"):
+                            _in_rnode = True
+                    elif _in_rnode and stripped.lower().startswith("announce_cap") and "=" in stripped:
+                        rnode_sections_with_cap.add(_cur_sec)
+
+                new_lines = []
+                i = 0
+                while i < len(lines):
+                    line = lines[i]
+                    stripped = line.strip()
+                    # Detect subsection header [[Name]]
+                    if stripped.startswith("[[") and stripped.endswith("]]"):
+                        # Before moving to next section, inject announce_cap if missing
+                        if in_rnode_section and current_section_name not in rnode_sections_with_cap:
+                            indent = "    "
+                            new_lines.append(f"{indent}announce_cap = {_LORA_ANNOUNCE_CAP_TEXT}\n")
+                            lora_cap_fixed_text.append(current_section_name)
+                            changed = True
+                        current_section_name = stripped[2:-2].strip()
+                        in_rnode_section = False
+                        new_lines.append(line)
+                        i += 1
+                        continue
+                    # Detect top-level section [Name] — reset rnode tracking
+                    if stripped.startswith("[") and not stripped.startswith("[["):
+                        if in_rnode_section and current_section_name not in rnode_sections_with_cap:
+                            indent = "    "
+                            new_lines.append(f"{indent}announce_cap = {_LORA_ANNOUNCE_CAP_TEXT}\n")
+                            lora_cap_fixed_text.append(current_section_name)
+                            changed = True
+                        in_rnode_section = False
+                        current_section_name = ""
+                        new_lines.append(line)
+                        i += 1
+                        continue
+                    # Detect type = RNodeInterface inside a subsection
+                    if stripped.lower().startswith("type") and "=" in stripped:
+                        val = stripped.split("=", 1)[1].strip().lower()
+                        if val in ("rnodeinterface", "rnodemultiinterface"):
+                            in_rnode_section = True
+                        new_lines.append(line)
+                        i += 1
+                        continue
+                    # Fix mode = access_point or mode = roaming inside an RNode section
+                    if in_rnode_section and stripped.lower().startswith("mode") and "=" in stripped:
+                        val = stripped.split("=", 1)[1].strip().lower()
+                        if val in ("access_point", "roaming", ""):
+                            indent = line[: len(line) - len(line.lstrip())]
+                            new_lines.append(f"{indent}mode = full\n")
+                            lora_mode_fixed_text.append(current_section_name)
+                            changed = True
+                            i += 1
+                            continue
+                    # Fix announce_cap < 50 inside an RNode section
+                    if in_rnode_section and stripped.lower().startswith("announce_cap") and "=" in stripped:
+                        try:
+                            cap_val = float(stripped.split("=", 1)[1].strip())
+                            if cap_val < _LORA_ANNOUNCE_CAP_TEXT:
+                                indent = line[: len(line) - len(line.lstrip())]
+                                new_lines.append(f"{indent}announce_cap = {_LORA_ANNOUNCE_CAP_TEXT}\n")
+                                lora_cap_fixed_text.append(current_section_name)
+                                changed = True
+                                i += 1
+                                continue
+                        except (ValueError, TypeError):
+                            pass
+                    new_lines.append(line)
+                    i += 1
+                # Handle last section if it's an RNode section without announce_cap
+                if in_rnode_section and current_section_name not in rnode_sections_with_cap:
+                    indent = "    "
+                    new_lines.append(f"{indent}announce_cap = {_LORA_ANNOUNCE_CAP_TEXT}\n")
+                    lora_cap_fixed_text.append(current_section_name)
+                    changed = True
+
+                if lora_mode_fixed_text or lora_cap_fixed_text:
+                    lines = [l.rstrip("\n") for l in new_lines]
+                if lora_mode_fixed_text:
+                    log.warning(
+                        "FIXED: RNodeInterface(s) %s had mode=access_point/roaming — "
+                        "changed to mode=full in %s. "
+                        "RESTART rnsd for the change to take effect. "
+                        "Without this fix, announces from I2P/TCP are NEVER forwarded to LoRa.",
+                        lora_mode_fixed_text, config_file,
+                    )
+                if lora_cap_fixed_text:
+                    log.info(
+                        "FIXED: RNodeInterface(s) %s had announce_cap < %d%% — "
+                        "set to %d%% in %s. "
+                        "RESTART rnsd for the change to take effect. "
+                        "Default 2%% cap causes 12.8s gaps between LoRa announces.",
+                        lora_cap_fixed_text, _LORA_ANNOUNCE_CAP_TEXT,
+                        _LORA_ANNOUNCE_CAP_TEXT, config_file,
+                    )
 
                 if changed:
                     config_file.write_text("\n".join(lines) + "\n")
@@ -1133,7 +1468,15 @@ class RatholeDaemon:
                     return {"ok": False, "error": err}
                 score = float(args.get("score", 1.0))
                 self.reputation.pin(identity, score)
-                return {"ok": True, "pinned": True, "score": score}
+                # Also add to trusted_peers.peers so the filter allows this
+                # peer's I2P announces through to LoRa.  Uses the first 16
+                # hex chars of the RNS identity hash as the prefix — this is
+                # the same hash shown in the TUI Peers tab.  For ANNOUNCE
+                # packets peer_hash == destination_hash (set by the hook).
+                # Removal is config-file-only (by design — no TUI remove).
+                added_to_trusted = self._add_to_trusted_peers(identity)
+                return {"ok": True, "pinned": True, "score": score,
+                        "added_to_trusted_peers": added_to_trusted}
             elif action == "unpin":
                 if not identity:
                     return {"ok": False, "error": "identity required"}
@@ -1373,7 +1716,10 @@ class RatholeDaemon:
             from .i2p import validate_b32_address
             if not validate_b32_address(b32):
                 return {"ok": False, "error": "Invalid B32 address (expected 52 base32 chars + .b32.i2p)"}
-            return self._add_i2p_peer_interface(b32)
+            mode = str(args.get("mode", "full")).strip().lower() or "full"
+            if mode not in ("full", "boundary"):
+                return {"ok": False, "error": "mode must be 'full' or 'boundary'"}
+            return self._add_i2p_peer_interface(b32, mode=mode)
         elif cmd == "remove_i2p_peer":
             name = args.get("name", "").strip()
             if not name:
@@ -1460,7 +1806,31 @@ class RatholeDaemon:
 
             config = {"name": name, "target_host": host, "target_port": str(port)}
             interface = TCPClientInterface(RNS.Transport, config)
-            self._rns_instance._add_interface(interface)
+
+            # Shared-instance client: _add_interface() is a no-op — init manually.
+            is_shared = getattr(self._rns_instance, "is_connected_to_shared_instance", False)
+            if is_shared:
+                from RNS.Interfaces.Interface import Interface as _RNSIface
+                interface.OUT  = True
+                interface.IN   = True
+                interface.mode = _RNSIface.MODE_FULL
+                interface.announce_cap          = RNS.Reticulum.ANNOUNCE_CAP / 100.0
+                interface.announce_rate_target  = None
+                interface.announce_rate_grace   = None
+                interface.announce_rate_penalty = None
+                interface.ifac_size = getattr(interface, "DEFAULT_IFAC_SIZE", 8)
+                if not hasattr(interface, "ifac_netname"):
+                    interface.ifac_netname = None
+                if not hasattr(interface, "ifac_netkey"):
+                    interface.ifac_netkey = None
+                RNS.Transport.add_interface(interface)
+                try:
+                    interface.final_init()
+                except Exception as _fi_err:
+                    log.debug("TCP client final_init (shared client): %s", _fi_err)
+            else:
+                self._rns_instance._add_interface(interface)
+
             log.info("Added TCP client interface: %s:%d", host, port)
 
             # Track with "new" flag so TUI shows "Connecting" on first add
@@ -1633,7 +2003,31 @@ class RatholeDaemon:
 
             config = {"name": name, "listen_ip": listen_ip, "listen_port": str(port)}
             interface = TCPServerInterface(RNS.Transport, config)
-            self._rns_instance._add_interface(interface)
+
+            # Shared-instance client: _add_interface() is a no-op — init manually.
+            is_shared = getattr(self._rns_instance, "is_connected_to_shared_instance", False)
+            if is_shared:
+                from RNS.Interfaces.Interface import Interface as _RNSIface
+                interface.OUT  = True
+                interface.IN   = True
+                interface.mode = _RNSIface.MODE_FULL
+                interface.announce_cap          = RNS.Reticulum.ANNOUNCE_CAP / 100.0
+                interface.announce_rate_target  = None
+                interface.announce_rate_grace   = None
+                interface.announce_rate_penalty = None
+                interface.ifac_size = getattr(interface, "DEFAULT_IFAC_SIZE", 8)
+                if not hasattr(interface, "ifac_netname"):
+                    interface.ifac_netname = None
+                if not hasattr(interface, "ifac_netkey"):
+                    interface.ifac_netkey = None
+                RNS.Transport.add_interface(interface)
+                try:
+                    interface.final_init()
+                except Exception as _fi_err:
+                    log.debug("TCP server final_init (shared client): %s", _fi_err)
+            else:
+                self._rns_instance._add_interface(interface)
+
             log.info("Added TCP server interface: %s:%d", listen_ip, port)
 
             # Track with "new" flag so TUI shows "Activating" on first add
@@ -1817,7 +2211,31 @@ class RatholeDaemon:
                 "connectable": True,
             }
             interface = RNS_I2PInterface(RNS.Transport, config)
-            self._rns_instance._add_interface(interface)
+
+            # Shared-instance client: _add_interface() is a no-op — init manually.
+            is_shared = getattr(self._rns_instance, "is_connected_to_shared_instance", False)
+            if is_shared:
+                from RNS.Interfaces.Interface import Interface as _RNSIface
+                interface.OUT  = True
+                interface.IN   = True
+                interface.mode = _RNSIface.MODE_FULL
+                interface.announce_cap          = RNS.Reticulum.ANNOUNCE_CAP / 100.0
+                interface.announce_rate_target  = None
+                interface.announce_rate_grace   = None
+                interface.announce_rate_penalty = None
+                interface.ifac_size = getattr(interface, "DEFAULT_IFAC_SIZE", 8)
+                if not hasattr(interface, "ifac_netname"):
+                    interface.ifac_netname = None
+                if not hasattr(interface, "ifac_netkey"):
+                    interface.ifac_netkey = None
+                RNS.Transport.add_interface(interface)
+                try:
+                    interface.final_init()
+                except Exception as _fi_err:
+                    log.debug("I2P server final_init (shared client): %s", _fi_err)
+            else:
+                self._rns_instance._add_interface(interface)
+
             self._i2p_interfaces.append(interface)
             log.info("Added I2P server interface: %s", name)
 
@@ -1916,15 +2334,29 @@ class RatholeDaemon:
             log.warning("I2P server active but failed to persist: %s", e)
 
     def _sync_i2p_peers_from_transport(self):
-        """Backfill _i2p_peers from the RNS config file at startup.
+        """Backfill _i2p_peers from the RNS config file and live Transport at startup.
 
         Called once after _init_reticulum().  Reads the persisted
         [[I2PInterface]] sections (connectable=no) from the RNS config file
         and populates _i2p_peers so the TUI shows them immediately on a
         fresh start without requiring a manual add via the TUI.
 
+        Also scans Transport.interfaces for long-name rnsd-managed peer
+        interfaces ("I2P Peer <b32[:8]> to <full_b32>") that may not have a
+        matching RNS config section (e.g. added by rnsd directly or with a
+        non-standard section name).  These are backfilled using the short name
+        derived from the long name so the TUI can display and manage them.
+
         The status (Checking/Connected) is determined at runtime by the
         status command scanning RNS.Transport.interfaces every 5 seconds.
+
+        IMPORTANT: rnsd names I2P peer interfaces with the long form
+        "I2P Peer <b32[:8]> to <full_b32>" while rathole uses the short
+        form "I2P Peer <b32[:8]>".  We store the SHORT name in _i2p_peers
+        (used for TUI display and duplicate detection in _add_i2p_peer_interface).
+        The duplicate check in _add_i2p_peer_interface matches both forms via
+        prefix matching (iface_name.startswith(name + " ")), so storing the
+        short name here is correct and prevents double-add on restart.
         """
         try:
             from .i2p import list_rns_i2p_peers
@@ -1935,20 +2367,120 @@ class RatholeDaemon:
                 config_file = _default_rns_dir() / "config"
 
             existing_names = {p.get("name", "") for p in self._i2p_peers}
+            # Also collect existing B32 addresses to prevent duplicate-by-address
+            existing_b32s = {p.get("b32", "") for p in self._i2p_peers}
             count = 0
-            for entry in list_rns_i2p_peers(config_file):
+
+            # Build a map of b32 → mode from the RNS config file so Pass 2
+            # can attach the persisted mode to live-transport entries.
+            # list_rns_i2p_peers() returns {"name", "b32", "mode"} where
+            # "b32" is the raw peers= value from the config section — it may
+            # be a comma-separated list (e.g. "addr1.b32.i2p, addr2.b32.i2p").
+            # We split on commas and strip each token so every individual B32
+            # address maps to the correct mode, regardless of how many peers
+            # are listed in a single section.
+            _config_mode_by_b32: dict[str, str] = {}
+            _config_entries = list_rns_i2p_peers(config_file)
+            for _ce in _config_entries:
+                _raw_b32 = _ce.get("b32", "")
+                _mode_val = _ce.get("mode", "full")
+                # Split comma-separated peer lists and register each address
+                for _token in _raw_b32.split(","):
+                    _cb32 = _token.strip()
+                    if _cb32:
+                        _config_mode_by_b32[_cb32] = _mode_val
+
+            # Pass 1: backfill from live Transport.interfaces (preferred source).
+            # rnsd-managed long-name interfaces ("I2P Peer <b32[:8]> to <full_b32>")
+            # are the authoritative live state.  We read them first so that Pass 2
+            # (config file) skips any B32 already covered here.
+            # Mode is taken from the persisted config (config_mode_by_b32) because
+            # the live interface object does not expose the mode string.
+            #
+            # IMPORTANT: rnsd's I2PInterface constructor ignores the "mode" key in
+            # the config dict — it always initialises the interface with MODE_FULL.
+            # We patch the mode on the live object here so that rnstatus and RNS
+            # Transport.outbound() both see the correct mode (e.g. MODE_BOUNDARY).
+            try:
+                import RNS as _RNS
+                from RNS.Interfaces.Interface import Interface as _RNSIface
+                _startup_mode_map = {
+                    "full":           _RNSIface.MODE_FULL,
+                    "boundary":       _RNSIface.MODE_BOUNDARY,
+                    "gateway":        _RNSIface.MODE_GATEWAY,
+                    "access_point":   _RNSIface.MODE_ACCESS_POINT,
+                    "roaming":        _RNSIface.MODE_ROAMING,
+                    "point_to_point": _RNSIface.MODE_POINT_TO_POINT,
+                }
+                for _iface in _RNS.Transport.interfaces:
+                    if "I2P" not in type(_iface).__name__:
+                        continue
+                    if getattr(_iface, "connectable", False):
+                        continue  # skip server interfaces
+                    _iname = getattr(_iface, "name", "") or ""
+                    if " to " not in _iname:
+                        continue  # skip short-name (stale) interfaces
+                    # Extract b32 from long name: "I2P Peer xxxxxxxx to full.b32.i2p"
+                    _b32 = _iname.split(" to ", 1)[1].strip()
+                    if not _b32:
+                        continue
+                    _mode = _config_mode_by_b32.get(_b32, "full")
+                    # Patch the live interface object so rnstatus and Transport
+                    # both see the correct mode.  rnsd's I2PInterface constructor
+                    # ignores the "mode" config key and always sets MODE_FULL.
+                    _desired_mode_int = _startup_mode_map.get(_mode, _RNSIface.MODE_FULL)
+                    _current_mode_int = getattr(_iface, "mode", _RNSIface.MODE_FULL)
+                    if _current_mode_int != _desired_mode_int:
+                        try:
+                            _iface.mode = _desired_mode_int
+                            log.info(
+                                "Patched I2P peer interface '%s' mode: %s → %s",
+                                _iname, _current_mode_int, _mode,
+                            )
+                        except Exception as _patch_err:
+                            log.debug("Could not patch mode on %s: %s", _iname, _patch_err)
+                    if _b32 in existing_b32s:
+                        continue
+                    _short = f"I2P Peer {_b32[:8]}"
+                    if _short in existing_names:
+                        continue
+                    self._i2p_peers.append({"name": _short, "b32": _b32, "mode": _mode})
+                    existing_names.add(_short)
+                    existing_b32s.add(_b32)
+                    count += 1
+                    log.info(
+                        "Loaded I2P peer from live transport at startup: %s (%s) mode=%s",
+                        _short, _b32[:16], _mode,
+                    )
+            except Exception as _te:
+                log.debug("Could not scan Transport.interfaces for I2P peers: %s", _te)
+
+            # Pass 2: backfill from RNS config file sections for any peers not
+            # already covered by the live transport scan above.  This handles
+            # peers that are persisted in the config but whose rnsd tunnel has
+            # not yet appeared in Transport.interfaces (e.g. slow SAM bootstrap).
+            for entry in _config_entries:
                 b32 = entry.get("b32", "").strip()
                 if not b32:
+                    continue
+                # Skip if already tracked by B32 address (live transport pass above)
+                if b32 in existing_b32s:
                     continue
                 short_name = f"I2P Peer {b32[:8]}"
                 if short_name in existing_names:
                     continue
-                self._i2p_peers.append({"name": short_name, "b32": b32})
+                mode_val = entry.get("mode", "full")
+                self._i2p_peers.append({"name": short_name, "b32": b32, "mode": mode_val})
                 existing_names.add(short_name)
+                existing_b32s.add(b32)
                 count += 1
-                log.info("Loaded I2P peer from config at startup: %s (%s)", short_name, b32[:16])
+                log.info(
+                    "Loaded I2P peer from config at startup: %s (%s) mode=%s",
+                    short_name, b32[:16], mode_val,
+                )
+
             if count:
-                log.info("Backfilled %d I2P peer(s) from RNS config", count)
+                log.info("Backfilled %d I2P peer(s) from RNS config/transport", count)
         except Exception as e:
             log.warning("Could not load I2P peers from config at startup: %s", e)
 
@@ -1967,8 +2499,16 @@ class RatholeDaemon:
         except Exception as e:
             log.warning("Interface active but failed to persist to config: %s", e)
 
-    def _add_i2p_peer_interface(self, b32_address: str) -> dict:
-        """Add an I2P peer interface at runtime."""
+    def _add_i2p_peer_interface(self, b32_address: str, mode: str = "full") -> dict:
+        """Add an I2P peer interface at runtime.
+
+        Args:
+            b32_address: Full B32 address (e.g. ``xxxx.b32.i2p``).
+            mode: ``"full"`` (default) or ``"boundary"``.  When ``"boundary"``,
+                  the persisted RNS config section will include
+                  ``mode = boundary``, ``ingress_control = yes``, and
+                  ``ic_max_held_announces = 0``.
+        """
         try:
             import RNS
             from RNS.Interfaces.I2PInterface import I2PInterface as RNS_I2PInterface
@@ -1987,6 +2527,13 @@ class RatholeDaemon:
             # by checking our own _i2p_peers tracking list: if the name is
             # NOT in our tracking, the interface was already removed by us
             # and is just a stale Down object — skip it.
+            #
+            # IMPORTANT: rnsd names I2P peer interfaces with the long form
+            # "I2P Peer <b32[:8]> to <full_b32>" while rathole uses the
+            # short form "I2P Peer <b32[:8]>".  The _sync_i2p_peers_from_transport
+            # backfill stores the short name in _i2p_peers, so the tracked_names
+            # set contains the short name.  The duplicate check must match BOTH
+            # forms to prevent adding a second interface for the same peer.
             tracked_names = {p.get("name", "") for p in self._i2p_peers}
             for iface in RNS.Transport.interfaces:
                 iface_name = getattr(iface, "name", "") or ""
@@ -2016,16 +2563,66 @@ class RatholeDaemon:
                 "connectable": False,
             }
             interface = RNS_I2PInterface(RNS.Transport, config)
-            self._rns_instance._add_interface(interface)
+
+            # When rathole runs as a shared-instance client,
+            # _add_interface() skips ALL initialization (OUT, mode,
+            # announce_rate_target, Transport.add_interface) because
+            # is_connected_to_shared_instance=True.  We must set the
+            # required attributes manually so the interface is properly
+            # registered and announces flow through it.
+            # Map the human-readable mode string to the RNS integer constant.
+            # This must be done for BOTH shared-instance and standalone paths so
+            # the live interface object carries the correct mode (e.g. MODE_BOUNDARY
+            # for boundary mode) rather than always defaulting to MODE_FULL.
+            from RNS.Interfaces.Interface import Interface as _RNSIface
+            _i2p_mode_map = {
+                "full":           _RNSIface.MODE_FULL,
+                "boundary":       _RNSIface.MODE_BOUNDARY,
+                "gateway":        _RNSIface.MODE_GATEWAY,
+                "access_point":   _RNSIface.MODE_ACCESS_POINT,
+                "roaming":        _RNSIface.MODE_ROAMING,
+                "point_to_point": _RNSIface.MODE_POINT_TO_POINT,
+            }
+            _interface_mode = _i2p_mode_map.get(mode.lower(), _RNSIface.MODE_FULL)
+            is_shared = getattr(self._rns_instance, "is_connected_to_shared_instance", False)
+            if is_shared:
+                interface.OUT  = True
+                interface.IN   = True
+                interface.mode = _interface_mode
+                interface.announce_cap          = RNS.Reticulum.ANNOUNCE_CAP / 100.0
+                interface.announce_rate_target  = None
+                interface.announce_rate_grace   = None
+                interface.announce_rate_penalty = None
+                interface.ifac_size = getattr(interface, "DEFAULT_IFAC_SIZE", 8)
+                if not hasattr(interface, "ifac_netname"):
+                    interface.ifac_netname = None
+                if not hasattr(interface, "ifac_netkey"):
+                    interface.ifac_netkey = None
+                RNS.Transport.add_interface(interface)
+                try:
+                    interface.final_init()
+                except Exception as _fi_err:
+                    log.debug("I2P peer final_init (shared client): %s", _fi_err)
+                log.info(
+                    "Added I2P peer (shared-instance manual init): %s mode=%s(%s)",
+                    b32_address[:16], mode, _interface_mode,
+                )
+            else:
+                # Pass mode= explicitly so RNS sets the correct interface mode on the
+                # live object.  Without this, _add_interface() defaults to MODE_FULL
+                # regardless of what was written to the config file — the same bug
+                # that was already fixed for LoRa (see _add_lora_interface line ~2836).
+                self._rns_instance._add_interface(interface, mode=_interface_mode)
+
             self._i2p_interfaces.append(interface)
             # Mark as "new" so the TUI shows "Connecting" (first-time tunnel
             # establishment) rather than "Checking…" (status poll after reconnect).
             # The flag is cleared once the peer becomes connected for the first time.
-            self._i2p_peers.append({"name": name, "b32": b32_address, "new": True})
-            log.info("Added I2P peer: %s", b32_address[:16])
+            self._i2p_peers.append({"name": name, "b32": b32_address, "new": True, "mode": mode})
+            log.info("Added I2P peer: %s (mode=%s)", b32_address[:16], mode)
 
-            self._persist_i2p_interface(name, b32_address)
-            return {"ok": True, "name": name}
+            self._persist_i2p_interface(name, b32_address, mode=mode)
+            return {"ok": True, "name": name, "mode": mode}
         except Exception as e:
             log.error("Failed to add I2P peer %s: %s", b32_address[:16], e)
             return {"ok": False, "error": str(e)}
@@ -2041,6 +2638,12 @@ class RatholeDaemon:
         Also clears in-memory tracking (_i2p_peers, _i2p_interfaces) and removes
         the section from the RNS config file so the interface does not reappear
         after rnsd restarts.
+
+        ``name`` is always the SHORT form "I2P Peer <b32[:8]>".  rnsd may have
+        loaded the same peer with the LONG form "I2P Peer <b32[:8]> to <full_b32>"
+        (when the config section is named with the short form but rnsd expands it
+        internally).  We match both forms so the detach always succeeds regardless
+        of which naming convention rnsd used.
         """
         try:
             import RNS
@@ -2053,9 +2656,12 @@ class RatholeDaemon:
 
             target = None
             for iface in list(RNS.Transport.interfaces):
-                if getattr(iface, "name", "") == name:
-                    target = iface
-                    break
+                iface_name = getattr(iface, "name", "") or ""
+                # Match exact short name OR long name that starts with short name + " to "
+                if iface_name == name or iface_name.startswith(name + " to "):
+                    if "I2P" in type(iface).__name__ and not getattr(iface, "connectable", False):
+                        target = iface
+                        break
 
             if target is None:
                 # Not live — may still be in config; try to remove from config anyway
@@ -2073,19 +2679,36 @@ class RatholeDaemon:
                     pass
 
                 try:
+                    # Use object identity (is not target) rather than name comparison
+                    # so that long-name rnsd interfaces are correctly removed even
+                    # when their name differs from the short ``name`` argument.
+                    # Also remove any OTHER interface objects that share the same
+                    # short name or long-name prefix — these are stale duplicates
+                    # left from a previous session that were not cleaned up on
+                    # startup (e.g. OUT=True short-name objects that survived the
+                    # _init_reticulum dedup pass).  Removing them here ensures the
+                    # re-add path starts with a clean slate.
                     remaining = [
                         i for i in RNS.Transport.interfaces
-                        if getattr(i, "name", "") != name
+                        if i is not target
+                        and not (
+                            "I2P" in type(i).__name__
+                            and not getattr(i, "connectable", False)
+                            and (
+                                (getattr(i, "name", "") or "") == name
+                                or (getattr(i, "name", "") or "").startswith(name + " ")
+                            )
+                        )
                     ]
                     if len(remaining) < len(RNS.Transport.interfaces):
                         RNS.Transport.interfaces[:] = remaining
                 except Exception as e:
                     log.debug("Could not filter transport interfaces: %s", e)
 
-                # Remove from our tracking list
+                # Remove from our tracking list (by object identity)
                 self._i2p_interfaces = [
                     i for i in self._i2p_interfaces
-                    if getattr(i, "name", "") != name
+                    if i is not target
                 ]
 
             # Remove from in-memory peers list
@@ -2126,7 +2749,7 @@ class RatholeDaemon:
         except Exception as e:
             log.warning("Failed to unpersist I2P interface %s: %s", name, e)
 
-    def _persist_i2p_interface(self, name: str, b32_address: str):
+    def _persist_i2p_interface(self, name: str, b32_address: str, mode: str = "full"):
         """Write the I2P peer to the RNS config file for persistence across restarts."""
         try:
             from .i2p import add_rns_i2p_interface
@@ -2136,8 +2759,8 @@ class RatholeDaemon:
             else:
                 config_file = _default_rns_dir() / "config"
             if config_file.exists():
-                add_rns_i2p_interface(config_file, name, peers=[b32_address])
-                log.info("Persisted I2P peer %s to %s", name, config_file)
+                add_rns_i2p_interface(config_file, name, peers=[b32_address], mode=mode)
+                log.info("Persisted I2P peer %s (mode=%s) to %s", name, mode, config_file)
         except Exception as e:
             log.warning("I2P peer active but failed to persist: %s", e)
 
@@ -2191,7 +2814,12 @@ class RatholeDaemon:
                 "boundary":       _RNSIface.MODE_BOUNDARY,         # 5
                 "point_to_point": _RNSIface.MODE_POINT_TO_POINT,   # 2
             }
-            interface_mode = _mode_map.get(mode.lower(), _RNSIface.MODE_ACCESS_POINT)
+            # Default to MODE_FULL so I2P→LoRa re-propagation works.
+            # MODE_ACCESS_POINT only re-propagates FROM LoRa clients TO other
+            # interfaces — it does NOT forward packets arriving from I2P/TCP
+            # back to LoRa.  MODE_FULL is the correct mode for a bridging
+            # transport node that needs bidirectional I2P↔LoRa forwarding.
+            interface_mode = _mode_map.get(mode.lower(), _RNSIface.MODE_FULL)
 
             config = {
                 "name": name,
@@ -2205,10 +2833,49 @@ class RatholeDaemon:
                 "enabled": "yes",
             }
             interface = RNodeInterface(RNS.Transport, config)
-            self._rns_instance._add_interface(interface, mode=interface_mode)
+
+            # Shared-instance client: _add_interface() is a no-op — init manually.
+            # We must set OUT, mode, announce_rate_target, and call
+            # Transport.add_interface() directly so the LoRa interface is
+            # properly registered and announces are forwarded to it.
+            # announce_cap for LoRa: use 50% instead of the RNS default 2%.
+            # At 2% and 6250 bps, the gap between announces is 12.8s which exceeds
+            # RNS's PATHFINDER_G rebroadcast grace window (~11s), causing most I2P
+            # announces to be silently dropped before reaching LoRa clients.
+            # 50% reduces the gap to ~0.5s, ensuring all queued announces are forwarded.
+            _LORA_ANNOUNCE_CAP_RUNTIME = 50.0 / 100.0  # 50%
+
+            is_shared = getattr(self._rns_instance, "is_connected_to_shared_instance", False)
+            if is_shared:
+                interface.OUT  = True
+                interface.IN   = True
+                interface.mode = interface_mode
+                interface.announce_cap          = _LORA_ANNOUNCE_CAP_RUNTIME
+                interface.announce_rate_target  = None
+                interface.announce_rate_grace   = None
+                interface.announce_rate_penalty = None
+                interface.ifac_size = getattr(interface, "DEFAULT_IFAC_SIZE", 8)
+                if not hasattr(interface, "ifac_netname"):
+                    interface.ifac_netname = None
+                if not hasattr(interface, "ifac_netkey"):
+                    interface.ifac_netkey = None
+                RNS.Transport.add_interface(interface)
+                try:
+                    interface.final_init()
+                except Exception as _fi_err:
+                    log.debug("LoRa final_init (shared client): %s", _fi_err)
+            else:
+                self._rns_instance._add_interface(interface, mode=interface_mode)
+                # Override announce_cap after _add_interface sets it from config default.
+                # _add_interface reads announce_cap from the RNS config file; if the config
+                # was just written by _ensure_transport_enabled it will already be 50%.
+                # Set it directly on the live object as belt-and-suspenders.
+                interface.announce_cap = _LORA_ANNOUNCE_CAP_RUNTIME
+
             log.info(
-                "Added LoRa interface: %s (mode=%s, freq=%d Hz, SF%d, BW=%d Hz, %d dBm)",
+                "Added LoRa interface: %s (mode=%s, freq=%d Hz, SF%d, BW=%d Hz, %d dBm, announce_cap=%.0f%%)",
                 name, mode, frequency, spreading_factor, bandwidth, txpower,
+                _LORA_ANNOUNCE_CAP_RUNTIME * 100,
             )
 
             self._persist_lora_interface(name, port, frequency, bandwidth, txpower, spreading_factor, coding_rate, mode=mode)
@@ -2349,6 +3016,67 @@ class RatholeDaemon:
             log.info("Persisted LoRa interface %s (mode=%s) to %s", name, mode, config_file)
         except Exception as e:
             log.warning("LoRa interface active but failed to persist: %s", e)
+
+    def _add_to_trusted_peers(self, identity: str) -> bool:
+        """Add *identity* to ``filters.trusted_peers.peers`` and save config.
+
+        Called automatically when a peer is pinned as TRUSTED via the TUI.
+        Stores the first 16 hex characters of the RNS identity hash as the
+        prefix — this is the same hash shown in the TUI Peers tab.  For
+        ANNOUNCE packets ``peer_hash == destination_hash`` (set by the hook),
+        so the filter correctly matches the announcing identity.
+
+        Side-effects
+        ------------
+        * Appends the 16-char prefix to ``filters.trusted_peers.peers``.
+        * Sets ``filters.trusted_peers.enabled = true`` so the filter
+          activates immediately — without this the peers list has no effect
+          because the filter is disabled by default.
+        * Calls ``_propagate_config()`` so the live TrustedPeerFilter
+          instance picks up the new peer without a daemon restart.
+        * Calls ``save_config()`` so the change is written to the TOML file
+          and survives a daemon restart.
+
+        Returns True if the peer was newly added, False if already present.
+        Removal is intentionally config-file-only (no TUI remove) so operators
+        must edit the TOML to revoke trusted status.
+        """
+        try:
+            prefix = identity[:16].lower()
+            tp_cfg = self.config.raw.setdefault("filters", {}).setdefault(
+                "trusted_peers", {}
+            )
+            peers: list = tp_cfg.setdefault("peers", [])
+            # Normalise existing entries for comparison
+            existing = {str(p).strip().lower() for p in peers}
+            if prefix in existing:
+                log.debug("trusted_peers: %s already in peers list", prefix)
+                return False
+            peers.append(prefix)
+            tp_cfg["peers"] = peers
+            # Enable the filter so the peers list actually takes effect.
+            # The filter is disabled by default (safe for non-LoRa nodes);
+            # once the operator pins a trusted peer we activate it so I2P
+            # announces from that peer are allowed through to LoRa.
+            was_disabled = not tp_cfg.get("enabled", False)
+            tp_cfg["enabled"] = True
+            self._propagate_config()
+            save_config(self.config)
+            if was_disabled:
+                log.info(
+                    "Added %s to trusted_peers.peers and enabled trusted_peers filter "
+                    "(pinned as TRUSTED via TUI)",
+                    prefix,
+                )
+            else:
+                log.info(
+                    "Added %s to trusted_peers.peers (pinned as TRUSTED via TUI)",
+                    prefix,
+                )
+            return True
+        except Exception as e:
+            log.warning("Could not add peer to trusted_peers: %s", e)
+            return False
 
     def _propagate_config(self):
         """Push current config to all subsystems that cache config values."""

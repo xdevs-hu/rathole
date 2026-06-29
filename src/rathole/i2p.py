@@ -352,11 +352,22 @@ def add_rns_i2p_interface(
     name: str,
     connectable: bool = False,
     peers: list[str] | None = None,
+    mode: str = "full",
 ):
     """Write an I2PInterface section to an RNS config file.
 
+    Args:
+        config_file: Path to the RNS config file.
+        name: Interface section name.
+        connectable: Whether this is a server (connectable) interface.
+        peers: List of B32 peer addresses for client interfaces.
+        mode: Interface mode — ``"full"`` (default) or ``"boundary"``.
+              When ``"boundary"``, adds ``mode = boundary``,
+              ``ingress_control = yes``, and ``ic_max_held_announces = 0``.
+
     Uses configobj if available, falls back to text append.
     """
+    is_boundary = mode.lower() == "boundary"
     try:
         from configobj import ConfigObj
         cfg = ConfigObj(str(config_file))
@@ -370,6 +381,10 @@ def add_rns_i2p_interface(
         }
         if peers:
             iface_cfg["peers"] = ", ".join(peers)
+        if is_boundary:
+            iface_cfg["mode"] = "boundary"
+            iface_cfg["ingress_control"] = "yes"
+            iface_cfg["ic_max_held_announces"] = "0"
 
         cfg["interfaces"][name] = iface_cfg
         cfg.write()
@@ -381,6 +396,10 @@ def add_rns_i2p_interface(
         entry += f"    connectable = {'yes' if connectable else 'no'}\n"
         if peers:
             entry += f"    peers = {', '.join(peers)}\n"
+        if is_boundary:
+            entry += "    mode = boundary\n"
+            entry += "    ingress_control = yes\n"
+            entry += "    ic_max_held_announces = 0\n"
 
         text = config_file.read_text()
         if "[interfaces]" in text:
@@ -429,8 +448,10 @@ def remove_rns_i2p_interface(config_file: Path, name: str) -> bool:
 def list_rns_i2p_peers(config_file: Path) -> list[dict]:
     """Return a list of I2P peer entries from the RNS config file.
 
-    Each entry is ``{"name": str, "b32": str}``.
+    Each entry is ``{"name": str, "b32": str, "mode": str}``.
     Only non-connectable I2PInterface sections (peer connections) are returned.
+    ``mode`` is ``"boundary"`` when the section contains ``mode = boundary``,
+    otherwise ``"full"`` (the default).
     """
     result = []
     if not config_file.exists():
@@ -449,7 +470,11 @@ def list_rns_i2p_peers(config_file: Path) -> list[dict]:
                 continue  # skip server interfaces
             peers_val = section.get("peers", "").strip()
             if peers_val:
-                result.append({"name": section_name, "b32": peers_val})
+                mode_val = section.get("mode", "full").strip().lower()
+                if mode_val not in ("full", "boundary", "gateway",
+                                    "access_point", "roaming", "point_to_point"):
+                    mode_val = "full"
+                result.append({"name": section_name, "b32": peers_val, "mode": mode_val})
         return result
     except ImportError:
         pass
@@ -470,7 +495,16 @@ def list_rns_i2p_peers(config_file: Path) -> list[dict]:
                 continue
             peers_m = re.search(r"peers\s*=\s*(.+)", body)
             if peers_m:
-                result.append({"name": section_name, "b32": peers_m.group(1).strip()})
+                mode_m = re.search(r"^\s*mode\s*=\s*(\S+)", body, re.MULTILINE)
+                mode_val = mode_m.group(1).strip().lower() if mode_m else "full"
+                if mode_val not in ("full", "boundary", "gateway",
+                                    "access_point", "roaming", "point_to_point"):
+                    mode_val = "full"
+                result.append({
+                    "name": section_name,
+                    "b32": peers_m.group(1).strip(),
+                    "mode": mode_val,
+                })
     except OSError:
         pass
 

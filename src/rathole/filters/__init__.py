@@ -22,6 +22,7 @@ from .base import BaseFilter
 
 # ── Announce filters (v0.1 originals) ────────────────────────────
 
+from .trusted_peers import TrustedPeerFilter
 from .allowdeny import AllowDenyFilter
 from .hop_ceiling import HopCeilingFilter
 from .rate_limit import RateLimitFilter
@@ -63,6 +64,7 @@ GLOBAL_FILTER_REGISTRY: list[tuple[str, type[BaseFilter]]] = [
 ]
 
 ANNOUNCE_FILTER_REGISTRY: list[tuple[str, type[BaseFilter]]] = [
+    ("trusted_peers",  TrustedPeerFilter),   # Must be first — gates I2P→LoRa before all other filters
     ("allowdeny",      AllowDenyFilter),
     ("hop_ceiling",    HopCeilingFilter),
     ("announce_size",  AnnounceSizeFilter),
@@ -96,6 +98,7 @@ FILTER_REGISTRY = ANNOUNCE_FILTER_REGISTRY
 __all__ = [
     "BaseFilter",
     # v0.1 filters
+    "TrustedPeerFilter",
     "AllowDenyFilter",
     "HopCeilingFilter",
     "RateLimitFilter",

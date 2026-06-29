@@ -1669,9 +1669,24 @@ def _setup_i2p(rns_config_file: Path, console) -> bool:
         console.print("  [yellow]i2pd could not be installed — I2P will not be available[/]")
         return False
 
+    # ── I2P client mode selection ─────────────────────────────────
+    console.print()
+    console.print("  [bold]I2P Interface Mode[/]")
+    console.print("    [bold]1.[/] Full     — Standard peer, participates in routing")
+    console.print("    [bold]2.[/] Boundary — Edge node: ingress control, no held announces")
+    console.print("  [dim]  Boundary mode adds: mode = boundary, ingress_control = yes, ic_max_held_announces = 0[/]")
+    console.print()
+    mode_choice = Prompt.ask(
+        "  Interface mode",
+        choices=["1", "2"],
+        default="1",
+    )
+    i2p_mode = "boundary" if mode_choice == "2" else "full"
+    console.print(f"  [green]✓[/] Mode: [bold]{i2p_mode}[/]")
+
     iface_name = "I2P Interface"
     _ensure_rns_config(rns_config_file)
-    add_rns_i2p_interface(rns_config_file, iface_name, connectable=True)
+    add_rns_i2p_interface(rns_config_file, iface_name, connectable=True, mode=i2p_mode)
     console.print(f"  [green]✓[/] I2P interface configured ({iface_name})")
     console.print("  [dim]Your B32 address will appear in the TUI Interfaces tab once the tunnel is up[/]")
     console.print("  [dim]Add I2P peers anytime from the TUI Interfaces tab[/]")
@@ -2065,8 +2080,37 @@ def cmd_network(args):
         return 0
 
     elif action == "add":
-        mode = args.net_mode  # "server", "client", or "lora"
+        mode = args.net_mode  # "server", "client", "lora", or "i2p"
         target = args.net_target
+
+        # ── I2P client peer interface ─────────────────────────────
+        if mode == "i2p":
+            from .i2p import validate_b32_address, add_rns_i2p_interface
+            b32 = target.strip()
+            if not b32.endswith(".b32.i2p"):
+                b32 = b32 + ".b32.i2p"
+            if not validate_b32_address(b32):
+                console.print("[red]Error:[/] Invalid B32 address (expected 52 base32 chars + .b32.i2p)")
+                return 1
+
+            i2p_mode = getattr(args, "i2p_mode", "full") or "full"
+            if i2p_mode not in ("full", "boundary"):
+                console.print("[red]Error:[/] --i2p-mode must be 'full' or 'boundary'")
+                return 1
+
+            iface_name = f"I2P Peer {b32[:8]}"
+            _ensure_rns_config(rns_config)
+            add_rns_i2p_interface(rns_config, iface_name, peers=[b32], mode=i2p_mode)
+
+            if _json_mode:
+                _output_json({"ok": True, "name": iface_name, "b32": b32, "mode": i2p_mode})
+                return 0
+
+            console.print(f"[green]✓[/] Added [cyan]{iface_name}[/] to {rns_config}")
+            if i2p_mode == "boundary":
+                console.print("  [dim]Boundary mode: mode = boundary, ingress_control = yes, ic_max_held_announces = 0[/]")
+            console.print("[dim]Restart Rathole to activate the new interface.[/]")
+            return 0
 
         # ── LoRa (RNode) interface ────────────────────────────────
         if mode == "lora":
@@ -2335,11 +2379,11 @@ def main():
     net_p.add_argument("--rns-config", default="", help="Path to RNS config file")
     net_sub = net_p.add_subparsers(dest="net_action")
 
-    net_add = net_sub.add_parser("add", help="Add a TCP or LoRa interface")
-    net_add.add_argument("net_mode", choices=["server", "client", "lora"],
-                         help="server (TCP listener), client (TCP connect), or lora (RNode)")
+    net_add = net_sub.add_parser("add", help="Add a TCP, LoRa, or I2P interface")
+    net_add.add_argument("net_mode", choices=["server", "client", "lora", "i2p"],
+                         help="server (TCP listener), client (TCP connect), lora (RNode), or i2p (I2P peer)")
     net_add.add_argument("net_target",
-                         help="host:port for TCP, or serial port for lora (e.g. /dev/ttyUSB0)")
+                         help="host:port for TCP, serial port for lora (e.g. /dev/ttyUSB0), or B32 address for i2p")
     # LoRa-specific optional args
     net_add.add_argument("--frequency", type=int, default=868_000_000,
                          help="LoRa frequency in Hz (default: 868000000)")
@@ -2351,6 +2395,10 @@ def main():
                          help="LoRa spreading factor 7-12 (default: 8)")
     net_add.add_argument("--cr", "--coding-rate", dest="coding_rate", type=int, default=5,
                          help="LoRa coding rate denominator 5-8 (default: 5 = 4/5)")
+    # I2P-specific optional args
+    net_add.add_argument("--i2p-mode", dest="i2p_mode", choices=["full", "boundary"], default="full",
+                         help="I2P interface mode: full (default) or boundary "
+                              "(adds mode=boundary, ingress_control=yes, ic_max_held_announces=0)")
 
     net_rm = net_sub.add_parser("remove", help="Remove a named interface")
     net_rm.add_argument("net_name", help="Interface name (from 'rat network')")
